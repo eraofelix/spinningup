@@ -8,6 +8,8 @@ import spinup.algos.pytorch.ppo.core as core
 from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
+from torch.utils.tensorboard import SummaryWriter
+import os
 
 
 class PPOBuffer:
@@ -199,6 +201,22 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Set up logger and save configuration
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
+    
+    # Set up TensorBoard writer
+    tb_writer = SummaryWriter(log_dir=logger_kwargs['output_dir'])
+    
+    # 用于存储当前 epoch 的数据
+    epoch_metrics = {
+        'ep_returns': [],
+        'ep_lengths': [],
+        'v_vals': [],
+        'loss_pi': [],
+        'loss_v': [],
+        'kl': [],
+        'entropy': [],
+        'clip_frac': [],
+        'stop_iter': []
+    }
 
     # Random seed
     seed += 10000 * proc_id()
@@ -290,6 +308,14 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                      KL=kl, Entropy=ent, ClipFrac=cf,
                      DeltaLossPi=(loss_pi.item() - pi_l_old),
                      DeltaLossV=(loss_v.item() - v_l_old))
+        
+        # 记录到 TensorBoard 指标中
+        epoch_metrics['loss_pi'].append(pi_l_old)
+        epoch_metrics['loss_v'].append(v_l_old)
+        epoch_metrics['kl'].append(kl)
+        epoch_metrics['entropy'].append(ent)
+        epoch_metrics['clip_frac'].append(cf)
+        epoch_metrics['stop_iter'].append(i)
 
     # Prepare for interaction with environment
     start_time = time.time()
@@ -309,6 +335,8 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             # save and log
             buf.store(o, a, r, v, logp)
             logger.store(VVals=v)
+            # 记录价值估计到 TensorBoard 指标中
+            epoch_metrics['v_vals'].append(v)
             
             # Update obs (critical!)
             o = next_o
@@ -329,6 +357,9 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 if terminal:
                     # only save EpRet / EpLen if trajectory finished
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
+                    # 同时记录到 TensorBoard 指标中
+                    epoch_metrics['ep_returns'].append(ep_ret)
+                    epoch_metrics['ep_lengths'].append(ep_len)
                 o, _ = env.reset()
                 ep_ret, ep_len = 0, 0
 
@@ -356,6 +387,58 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         logger.log_tabular('StopIter', average_only=True)
         logger.log_tabular('Time', time.time()-start_time)
         logger.dump_tabular()
+        
+        # 记录到 TensorBoard
+        # 基本训练指标
+        tb_writer.add_scalar('Training/Epoch', epoch, epoch)
+        tb_writer.add_scalar('Training/Environment_Interactions', (epoch + 1) * steps_per_epoch, epoch)
+        tb_writer.add_scalar('Training/Time', time.time() - start_time, epoch)
+        
+        # 记录奖励
+        if epoch_metrics['ep_returns']:
+            tb_writer.add_scalar('Reward/Episode_Return', np.mean(epoch_metrics['ep_returns']), epoch)
+            if len(epoch_metrics['ep_returns']) > 1:
+                tb_writer.add_scalar('Reward/Episode_Return_Std', np.std(epoch_metrics['ep_returns']), epoch)
+        
+        # 记录回合长度
+        if epoch_metrics['ep_lengths']:
+            tb_writer.add_scalar('Episode/Length', np.mean(epoch_metrics['ep_lengths']), epoch)
+        
+        # 记录价值估计
+        if epoch_metrics['v_vals']:
+            tb_writer.add_scalar('Values/Value_Estimates', np.mean(epoch_metrics['v_vals']), epoch)
+        
+        # 记录损失
+        if epoch_metrics['loss_pi']:
+            tb_writer.add_scalar('Loss/Policy_Loss', np.mean(epoch_metrics['loss_pi']), epoch)
+        if epoch_metrics['loss_v']:
+            tb_writer.add_scalar('Loss/Value_Loss', np.mean(epoch_metrics['loss_v']), epoch)
+        
+        # 记录策略指标
+        if epoch_metrics['kl']:
+            tb_writer.add_scalar('Policy/KL_Divergence', np.mean(epoch_metrics['kl']), epoch)
+        if epoch_metrics['entropy']:
+            tb_writer.add_scalar('Policy/Entropy', np.mean(epoch_metrics['entropy']), epoch)
+        if epoch_metrics['clip_frac']:
+            tb_writer.add_scalar('Policy/ClipFraction', np.mean(epoch_metrics['clip_frac']), epoch)
+        
+        # 记录训练指标
+        if epoch_metrics['stop_iter']:
+            tb_writer.add_scalar('Training/StopIterations', np.mean(epoch_metrics['stop_iter']), epoch)
+        
+        # 清空当前 epoch 的数据，为下一个 epoch 做准备
+        for key in epoch_metrics:
+            epoch_metrics[key] = []
+        
+        # Log model parameters to TensorBoard
+        if epoch % 10 == 0:  # Log every 10 epochs to avoid too much data
+            for name, param in ac.named_parameters():
+                tb_writer.add_histogram(f'Model/{name}', param, epoch)
+        
+        tb_writer.flush()
+    
+    # Close TensorBoard writer
+    tb_writer.close()
 
 if __name__ == '__main__':
     import argparse
