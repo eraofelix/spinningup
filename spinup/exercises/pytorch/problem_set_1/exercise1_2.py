@@ -109,7 +109,7 @@ if __name__ == '__main__':
     from spinup import ppo_pytorch as ppo
     from spinup.exercises.common import print_result
     from functools import partial
-    import gym
+    import gymnasium as gym
     import os
     import pandas as pd
     import psutil
