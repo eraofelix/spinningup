@@ -5,7 +5,6 @@ import gymnasium as gym
 import gymnasium_robotics
 import time
 import spinup.algos.pytorch.ppo.core as core
-from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 from torch.utils.tensorboard import SummaryWriter
@@ -91,7 +90,7 @@ class PPOBuffer:
 def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, logger_kwargs=dict(), save_freq=10):
+        target_kl=0.05, logger_kwargs=dict(), save_freq=1000):
     """
     Proximal Policy Optimization (by clipping), 
 
@@ -198,12 +197,36 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
     setup_pytorch_for_mpi()
 
-    # Set up logger and save configuration
-    logger = EpochLogger(**logger_kwargs)
-    logger.save_config(locals())
-    
     # Set up TensorBoard writer
     tb_writer = SummaryWriter(log_dir=logger_kwargs['output_dir'])
+    
+    # Save configuration to JSON file
+    config_path = os.path.join(logger_kwargs['output_dir'], 'config.json')
+    os.makedirs(logger_kwargs['output_dir'], exist_ok=True)
+    import json
+    
+    # 只保存重要的配置参数，避免循环引用
+    config_dict = {
+        'env_fn': str(env_fn),
+        'actor_critic': str(actor_critic),
+        'ac_kwargs': ac_kwargs,
+        'seed': seed,
+        'steps_per_epoch': steps_per_epoch,
+        'epochs': epochs,
+        'gamma': gamma,
+        'clip_ratio': clip_ratio,
+        'pi_lr': pi_lr,
+        'vf_lr': vf_lr,
+        'train_pi_iters': train_pi_iters,
+        'train_v_iters': train_v_iters,
+        'lam': lam,
+        'max_ep_len': max_ep_len,
+        'target_kl': target_kl,
+        'save_freq': save_freq
+    }
+    
+    with open(config_path, 'w') as f:
+        json.dump(config_dict, f, indent=2)
     
     # 用于存储当前 epoch 的数据
     epoch_metrics = {
@@ -236,7 +259,7 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Count variables
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v])
-    logger.log('\nNumber of parameters: \t pi: %d, \t v: %d\n'%var_counts)
+    print(f'\nNumber of parameters: \t pi: {var_counts[0]}, \t v: {var_counts[1]}\n')
 
     # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
@@ -270,8 +293,10 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
     vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr)
 
-    # Set up model saving
-    logger.setup_pytorch_saver(ac)
+    # Set up model saving (simplified)
+    def save_model(epoch):
+        model_path = os.path.join(logger_kwargs['output_dir'], f'model_epoch_{epoch}.pth')
+        torch.save(ac.state_dict(), model_path)
 
     def update():
         data = buf.get()
@@ -286,13 +311,11 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_pi, pi_info = compute_loss_pi(data)
             kl = mpi_avg(pi_info['kl'])
             if kl > 1.5 * target_kl:
-                logger.log('Early stopping at step %d due to reaching max kl.'%i)
+                print(f'Early stopping at step {i} due to reaching max kl.')
                 break
             loss_pi.backward()
             mpi_avg_grads(ac.pi)    # average grads across MPI processes
             pi_optimizer.step()
-
-        logger.store(StopIter=i)
 
         # Value function learning
         for i in range(train_v_iters):
@@ -304,10 +327,6 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         # Log changes from update
         kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
-        logger.store(LossPi=pi_l_old, LossV=v_l_old,
-                     KL=kl, Entropy=ent, ClipFrac=cf,
-                     DeltaLossPi=(loss_pi.item() - pi_l_old),
-                     DeltaLossV=(loss_v.item() - v_l_old))
         
         # 记录到 TensorBoard 指标中
         epoch_metrics['loss_pi'].append(pi_l_old)
@@ -334,7 +353,6 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
             # save and log
             buf.store(o, a, r, v, logp)
-            logger.store(VVals=v)
             # 记录价值估计到 TensorBoard 指标中
             epoch_metrics['v_vals'].append(v)
             
@@ -355,9 +373,7 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     v = 0
                 buf.finish_path(v)
                 if terminal:
-                    # only save EpRet / EpLen if trajectory finished
-                    logger.store(EpRet=ep_ret, EpLen=ep_len)
-                    # 同时记录到 TensorBoard 指标中
+                    # 记录到 TensorBoard 指标中
                     epoch_metrics['ep_returns'].append(ep_ret)
                     epoch_metrics['ep_lengths'].append(ep_len)
                 o, _ = env.reset()
@@ -366,27 +382,28 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         # Save model
         if (epoch % save_freq == 0) or (epoch == epochs-1):
-            logger.save_state({'env': env}, None)
+            save_model(epoch)
 
         # Perform PPO update!
         update()
 
-        # Log info about epoch
-        logger.log_tabular('Epoch', epoch)
-        logger.log_tabular('EpRet', with_min_and_max=True)
-        logger.log_tabular('EpLen', average_only=True)
-        logger.log_tabular('VVals', with_min_and_max=True)
-        logger.log_tabular('TotalEnvInteracts', (epoch+1)*steps_per_epoch)
-        logger.log_tabular('LossPi', average_only=True)
-        logger.log_tabular('LossV', average_only=True)
-        logger.log_tabular('DeltaLossPi', average_only=True)
-        logger.log_tabular('DeltaLossV', average_only=True)
-        logger.log_tabular('Entropy', average_only=True)
-        logger.log_tabular('KL', average_only=True)
-        logger.log_tabular('ClipFrac', average_only=True)
-        logger.log_tabular('StopIter', average_only=True)
-        logger.log_tabular('Time', time.time()-start_time)
-        logger.dump_tabular()
+        # Print epoch info
+        print(f"Epoch {epoch}:")
+        if epoch_metrics['ep_returns']:
+            print(f"  Episode Return: {np.mean(epoch_metrics['ep_returns']):.2f} ± {np.std(epoch_metrics['ep_returns']):.2f}")
+        if epoch_metrics['ep_lengths']:
+            print(f"  Episode Length: {np.mean(epoch_metrics['ep_lengths']):.2f}")
+        if epoch_metrics['loss_pi']:
+            print(f"  Policy Loss: {np.mean(epoch_metrics['loss_pi']):.4f}")
+        if epoch_metrics['loss_v']:
+            print(f"  Value Loss: {np.mean(epoch_metrics['loss_v']):.4f}")
+        if epoch_metrics['kl']:
+            print(f"  KL Divergence: {np.mean(epoch_metrics['kl']):.4f}")
+        if epoch_metrics['entropy']:
+            print(f"  Entropy: {np.mean(epoch_metrics['entropy']):.4f}")
+        print(f"  Environment Interactions: {(epoch+1)*steps_per_epoch}")
+        print(f"  Time: {time.time()-start_time:.2f}s")
+        print("-" * 50)
         
         # 记录到 TensorBoard
         # 基本训练指标
