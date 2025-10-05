@@ -203,7 +203,7 @@ class PPOBuffer:
         
         self.path_start_idx = self.ptr
 
-    def get(self):
+    def get(self, use_mpi=True):
         """
         Call this at the end of an epoch to get all of the data from
         the buffer, with advantages appropriately normalized (shifted to have
@@ -212,7 +212,10 @@ class PPOBuffer:
         assert self.ptr == self.max_size    # buffer has to be full before you can get
         self.ptr, self.path_start_idx = 0, 0
         # the next two lines implement the advantage normalization trick
-        adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
+        if use_mpi:
+            adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
+        else:
+            adv_mean, adv_std = np.mean(self.adv_buf), np.std(self.adv_buf)
         self.adv_buf = (self.adv_buf - adv_mean) / adv_std
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
                     adv=self.adv_buf, logp=self.logp_buf)
@@ -229,7 +232,7 @@ class PPOAgent:
     def __init__(self, env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-                 target_kl=0.05, logger_kwargs=dict(), save_freq=100):
+                 target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True):
         """
         Initialize PPO Agent
         
@@ -278,6 +281,9 @@ class PPOAgent:
 
             save_freq (int): How often (in terms of gap between epochs) to save
                 the current policy and value function.
+                
+            use_mpi (bool): Whether to use MPI for parallel training. If False,
+                runs in single-process mode.
         """
         # Store parameters
         self.env_fn = env_fn
@@ -297,6 +303,7 @@ class PPOAgent:
         self.target_kl = target_kl
         self.logger_kwargs = logger_kwargs
         self.save_freq = save_freq
+        self.use_mpi = use_mpi
         
         # Initialize components
         self._setup_environment()
@@ -305,8 +312,17 @@ class PPOAgent:
     
     def _setup_environment(self):
         """Setup environment and related components"""
-        # Special function to avoid certain slowdowns from PyTorch + MPI combo.
-        setup_pytorch_for_mpi()
+        if self.use_mpi:
+            # Special function to avoid certain slowdowns from PyTorch + MPI combo.
+            print(f"🔧 进程 {proc_id()}: 开始设置 PyTorch MPI...")
+            try:
+                setup_pytorch_for_mpi()
+                print(f"✅ 进程 {proc_id()}: PyTorch MPI 设置完成")
+            except Exception as e:
+                print(f"❌ 进程 {proc_id()}: PyTorch MPI 设置失败: {e}")
+                raise
+        else:
+            print("🚫 禁用MPI模式: 跳过MPI设置")
 
         # 创建带时间戳的输出目录
         from datetime import datetime
@@ -381,11 +397,12 @@ class PPOAgent:
         # Create actor-critic module
         self.ac = self.actor_critic(self.env.observation_space, self.env.action_space, **self.ac_kwargs)
 
-        # Sync params across processes
-        sync_params(self.ac)
+        # Sync params across processes (only if using MPI)
+        if self.use_mpi:
+            sync_params(self.ac)
 
-        # Count variables (only for first process)
-        if proc_id() == 0:
+        # Count variables (only for first process or single process mode)
+        if not self.use_mpi or proc_id() == 0:
             var_counts = tuple(count_vars(module) for module in [self.ac.pi, self.ac.v])
             print(f'\nNumber of parameters: pi: {var_counts[0]}, v: {var_counts[1]}')
             print("=" * 120)
@@ -395,7 +412,10 @@ class PPOAgent:
     def _setup_training_components(self):
         """Setup training components"""
         # Set up experience buffer
-        self.local_steps_per_epoch = int(self.steps_per_epoch / num_procs())
+        if self.use_mpi:
+            self.local_steps_per_epoch = int(self.steps_per_epoch / num_procs())
+        else:
+            self.local_steps_per_epoch = self.steps_per_epoch
         self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam)
 
         # Set up optimizers for policy and value function
@@ -433,7 +453,7 @@ class PPOAgent:
 
     def _update(self):
         """Perform PPO update"""
-        data = self.buf.get()
+        data = self.buf.get(self.use_mpi)
 
         pi_l_old, pi_info_old = self._compute_loss_pi(data)
         pi_l_old = pi_l_old.item()
@@ -443,11 +463,15 @@ class PPOAgent:
         for i in range(self.train_pi_iters):
             self.pi_optimizer.zero_grad()
             loss_pi, pi_info = self._compute_loss_pi(data)
-            kl = mpi_avg(pi_info['kl'])
+            if self.use_mpi:
+                kl = mpi_avg(pi_info['kl'])
+            else:
+                kl = pi_info['kl']
             if kl > 1.5 * self.target_kl:
                 break
             loss_pi.backward()
-            mpi_avg_grads(self.ac.pi)    # average grads across MPI processes
+            if self.use_mpi:
+                mpi_avg_grads(self.ac.pi)    # average grads across MPI processes
             self.pi_optimizer.step()
 
         # Value function learning
@@ -455,7 +479,8 @@ class PPOAgent:
             self.vf_optimizer.zero_grad()
             loss_v = self._compute_loss_v(data)
             loss_v.backward()
-            mpi_avg_grads(self.ac.v)    # average grads across MPI processes
+            if self.use_mpi:
+                mpi_avg_grads(self.ac.v)    # average grads across MPI processes
             self.vf_optimizer.step()
 
         # Log changes from update
@@ -471,8 +496,8 @@ class PPOAgent:
 
     def _log_epoch_info(self, epoch, start_time):
         """Log epoch information"""
-        # Print epoch info (only for first process)
-        if proc_id() == 0:
+        # Print epoch info (only for first process or single process mode)
+        if not self.use_mpi or proc_id() == 0:
             # 计算平均值
             ep_return = np.mean(self.epoch_metrics['ep_returns']) if self.epoch_metrics['ep_returns'] else 0.0
             policy_loss = np.mean(self.epoch_metrics['loss_pi']) if self.epoch_metrics['loss_pi'] else 0.0
@@ -566,7 +591,7 @@ class PPOAgent:
                 epoch_ended = t==self.local_steps_per_epoch-1
 
                 if terminal or epoch_ended:
-                    if epoch_ended and not(terminal) and proc_id() == 0:
+                    if epoch_ended and not(terminal) and (not self.use_mpi or proc_id() == 0):
                         print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                     # if trajectory didn't reach terminal state, bootstrap value target
                     if timeout or epoch_ended:
@@ -598,7 +623,7 @@ class PPOAgent:
 def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.05, logger_kwargs=dict(), save_freq=100):
+        target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True):
     """
     Proximal Policy Optimization (by clipping) function for backward compatibility
     
@@ -606,7 +631,7 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
     """
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
-                    lam, max_ep_len, target_kl, logger_kwargs, save_freq)
+                    lam, max_ep_len, target_kl, logger_kwargs, save_freq, use_mpi)
     agent.train()
 
 
@@ -627,9 +652,16 @@ if __name__ == '__main__':
     parser.add_argument('--train_pi_iters', type=int, default=80, help='策略网络训练迭代次数')
     parser.add_argument('--train_v_iters', type=int, default=80, help='价值网络训练迭代次数')
     parser.add_argument('--target_kl', type=float, default=0.01, help='KL散度目标值（更保守）')
+    parser.add_argument('--no-mpi', action='store_true', help='禁用MPI，使用单进程模式')
     args = parser.parse_args()
 
-    mpi_fork(args.cpu)  # run parallel code with mpi
+    # 根据参数决定是否使用MPI
+    use_mpi = not args.no_mpi
+    
+    if use_mpi:
+        mpi_fork(args.cpu)  # run parallel code with mpi
+    else:
+        print("🚫 禁用MPI模式: 使用单进程训练")
 
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
@@ -639,4 +671,4 @@ if __name__ == '__main__':
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
         train_v_iters=args.train_v_iters, target_kl=args.target_kl,
-        logger_kwargs=logger_kwargs)
+        logger_kwargs=logger_kwargs, use_mpi=use_mpi)
