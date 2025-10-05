@@ -90,7 +90,8 @@ class PPOBuffer:
 def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.05, logger_kwargs=dict(), save_freq=1000):
+        target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_custom_env=False,
+        head_penalty_weight=10.0, head_threshold=0.1):
     """
     Proximal Policy Optimization (by clipping), 
 
@@ -238,7 +239,8 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         'kl': [],
         'entropy': [],
         'clip_frac': [],
-        'stop_iter': []
+        'stop_iter': [],
+        'episode_infos': []  # 存储每个回合的详细信息
     }
 
     # Random seed
@@ -248,6 +250,7 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Instantiate environment
     env = env_fn()
+    
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
 
@@ -376,6 +379,15 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     # 记录到 TensorBoard 指标中
                     epoch_metrics['ep_returns'].append(ep_ret)
                     epoch_metrics['ep_lengths'].append(ep_len)
+                    # 保存回合信息（如果使用自定义环境）
+                    if use_custom_env:
+                        episode_info = {
+                            'ep_return': ep_ret,
+                            'ep_length': ep_len,
+                            'reward_diff': 0,  # 将在后续更新
+                            'head_penalty': 0   # 将在后续更新
+                        }
+                        epoch_metrics['episode_infos'].append(episode_info)
                 o, _ = env.reset()
                 ep_ret, ep_len = 0, 0
 
@@ -410,6 +422,14 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         tb_writer.add_scalar('Training/Epoch', epoch, epoch)
         tb_writer.add_scalar('Training/Environment_Interactions', (epoch + 1) * steps_per_epoch, epoch)
         tb_writer.add_scalar('Training/Time', time.time() - start_time, epoch)
+        
+        # 记录自定义奖励信息（如果使用自定义环境）
+        if use_custom_env and epoch_metrics['ep_returns']:
+            # 计算平均奖励差异
+            reward_diffs = [info.get('reward_diff', 0) for info in epoch_metrics.get('episode_infos', [])]
+            if reward_diffs:
+                tb_writer.add_scalar('Custom/Reward_Diff', np.mean(reward_diffs), epoch)
+                tb_writer.add_scalar('Custom/Head_Penalty', np.mean([info.get('head_penalty', 0) for info in epoch_metrics.get('episode_infos', [])]), epoch)
         
         # 记录奖励
         if epoch_metrics['ep_returns']:
@@ -461,14 +481,22 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='HalfCheetah-v5')
-    parser.add_argument('--hid', type=int, default=64)
-    parser.add_argument('--l', type=int, default=2)
+    parser.add_argument('--hid', type=int, default=256)
+    parser.add_argument('--l', type=int, default=3)
     parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--pi_lr', type=float, default=3e-4, help='策略网络学习率')
+    parser.add_argument('--vf_lr', type=float, default=1e-3, help='价值网络学习率')
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=4)
     parser.add_argument('--steps', type=int, default=4000)
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--exp_name', type=str, default='ppo')
+    parser.add_argument('--use_custom_env', action='store_true', help='使用自定义环境（头部着地惩罚）')
+    parser.add_argument('--head_penalty', type=float, default=10.0, help='头部着地惩罚权重（建议10-20）')
+    parser.add_argument('--head_threshold', type=float, default=0.15, help='头部着地阈值（建议0.1-0.2）')
+    parser.add_argument('--train_pi_iters', type=int, default=80, help='策略网络训练迭代次数')
+    parser.add_argument('--train_v_iters', type=int, default=80, help='价值网络训练迭代次数')
+    parser.add_argument('--target_kl', type=float, default=0.01, help='KL散度目标值（更保守）')
     args = parser.parse_args()
 
     mpi_fork(args.cpu)  # run parallel code with mpi
@@ -479,4 +507,7 @@ if __name__ == '__main__':
     ppo(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
-        logger_kwargs=logger_kwargs)
+        pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
+        train_v_iters=args.train_v_iters, target_kl=args.target_kl,
+        logger_kwargs=logger_kwargs, use_custom_env=args.use_custom_env,
+        head_penalty_weight=args.head_penalty, head_threshold=args.head_threshold)
