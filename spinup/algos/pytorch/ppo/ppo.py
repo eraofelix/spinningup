@@ -260,9 +260,13 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Sync params across processes
     sync_params(ac)
 
-    # Count variables
-    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v])
-    print(f'\nNumber of parameters: \t pi: {var_counts[0]}, \t v: {var_counts[1]}\n')
+    # Count variables (only for first process)
+    if proc_id() == 0:
+        var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v])
+        print(f'\nNumber of parameters: pi: {var_counts[0]}, v: {var_counts[1]}')
+        print("=" * 120)
+        print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | Early Stop")
+        print("=" * 120)
 
     # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
@@ -314,7 +318,6 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_pi, pi_info = compute_loss_pi(data)
             kl = mpi_avg(pi_info['kl'])
             if kl > 1.5 * target_kl:
-                print(f'Early stopping at step {i} due to reaching max kl.')
                 break
             loss_pi.backward()
             mpi_avg_grads(ac.pi)    # average grads across MPI processes
@@ -367,7 +370,7 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             epoch_ended = t==local_steps_per_epoch-1
 
             if terminal or epoch_ended:
-                if epoch_ended and not(terminal):
+                if epoch_ended and not(terminal) and proc_id() == 0:
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
@@ -399,23 +402,21 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # Perform PPO update!
         update()
 
-        # Print epoch info
-        print(f"Epoch {epoch}:")
-        if epoch_metrics['ep_returns']:
-            print(f"  Episode Return: {np.mean(epoch_metrics['ep_returns']):.2f} ± {np.std(epoch_metrics['ep_returns']):.2f}")
-        if epoch_metrics['ep_lengths']:
-            print(f"  Episode Length: {np.mean(epoch_metrics['ep_lengths']):.2f}")
-        if epoch_metrics['loss_pi']:
-            print(f"  Policy Loss: {np.mean(epoch_metrics['loss_pi']):.4f}")
-        if epoch_metrics['loss_v']:
-            print(f"  Value Loss: {np.mean(epoch_metrics['loss_v']):.4f}")
-        if epoch_metrics['kl']:
-            print(f"  KL Divergence: {np.mean(epoch_metrics['kl']):.4f}")
-        if epoch_metrics['entropy']:
-            print(f"  Entropy: {np.mean(epoch_metrics['entropy']):.4f}")
-        print(f"  Environment Interactions: {(epoch+1)*steps_per_epoch}")
-        print(f"  Time: {time.time()-start_time:.2f}s")
-        print("-" * 50)
+        # Print epoch info (only for first process)
+        if proc_id() == 0:
+            # 计算平均值
+            ep_return = np.mean(epoch_metrics['ep_returns']) if epoch_metrics['ep_returns'] else 0.0
+            policy_loss = np.mean(epoch_metrics['loss_pi']) if epoch_metrics['loss_pi'] else 0.0
+            value_loss = np.mean(epoch_metrics['loss_v']) if epoch_metrics['loss_v'] else 0.0
+            kl_div = np.mean(epoch_metrics['kl']) if epoch_metrics['kl'] else 0.0
+            entropy = np.mean(epoch_metrics['entropy']) if epoch_metrics['entropy'] else 0.0
+            
+            # 检查是否有早停
+            early_stop = np.mean(epoch_metrics['stop_iter']) if epoch_metrics['stop_iter'] else 0.0
+            early_stop_flag = "True" if early_stop < train_pi_iters - 1 else "False"
+            
+            # 单行打印，严格对齐
+            print(f"Epoch {epoch:4d} | Return: {ep_return:8.2f} | Policy Loss: {policy_loss:8.4f} | Value Loss: {value_loss:8.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:8.4f} | Early Stop: {early_stop_flag:5s}")
         
         # 记录到 TensorBoard
         # 基本训练指标
