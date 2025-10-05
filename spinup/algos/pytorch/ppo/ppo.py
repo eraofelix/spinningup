@@ -4,15 +4,84 @@ from torch.optim import Adam
 import gymnasium as gym
 import gymnasium_robotics
 import time
-from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
-from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
+# from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
+# from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 from torch.utils.tensorboard import SummaryWriter
 import os
+import os.path as osp
 import scipy.signal
 from gymnasium.spaces import Box, Discrete
 import torch.nn as nn
 from torch.distributions.normal import Normal
 from torch.distributions.categorical import Categorical
+
+# Constants moved from user_config.py
+DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'data')
+FORCE_DATESTAMP = False
+
+
+def setup_logger_kwargs(exp_name, seed=None, data_dir=None, datestamp=False):
+    """
+    Sets up the output_dir for a logger and returns a dict for logger kwargs.
+
+    If no seed is given and datestamp is false, 
+
+    ::
+
+        output_dir = data_dir/exp_name
+
+    If a seed is given and datestamp is false,
+
+    ::
+
+        output_dir = data_dir/exp_name/exp_name_s[seed]
+
+    If datestamp is true, amend to
+
+    ::
+
+        output_dir = data_dir/YY-MM-DD_exp_name/YY-MM-DD_HH-MM-SS_exp_name_s[seed]
+
+    You can force datestamp=True by setting ``FORCE_DATESTAMP=True`` in 
+    ``spinup/user_config.py``. 
+
+    Args:
+
+        exp_name (string): Name for experiment.
+
+        seed (int): Seed for random number generators used by experiment.
+
+        data_dir (string): Path to folder where results should be saved.
+            Default is the ``DEFAULT_DATA_DIR`` in ``spinup/user_config.py``.
+
+        datestamp (bool): Whether to include a date and timestamp in the
+            name of the save directory.
+
+    Returns:
+
+        logger_kwargs, a dict containing output_dir and exp_name.
+    """
+
+    # Datestamp forcing
+    datestamp = datestamp or FORCE_DATESTAMP
+
+    # Make base path
+    ymd_time = time.strftime("%Y-%m-%d_") if datestamp else ''
+    relpath = ''.join([ymd_time, exp_name])
+    
+    if seed is not None:
+        # Make a seed-specific subfolder in the experiment directory.
+        if datestamp:
+            hms_time = time.strftime("%Y-%m-%d_%H-%M-%S")
+            subfolder = ''.join([hms_time, '-', exp_name, '_s', str(seed)])
+        else:
+            subfolder = ''.join([exp_name, '_s', str(seed)])
+        relpath = osp.join(relpath, subfolder)
+
+    data_dir = data_dir or DEFAULT_DATA_DIR
+    logger_kwargs = dict(output_dir=osp.join(data_dir, relpath), 
+                         exp_name=exp_name)
+    return logger_kwargs
 
 
 def combined_shape(length, shape=None):
@@ -383,7 +452,7 @@ class PPOAgent:
         }
 
         # Random seed
-        seed = self.seed + 10000 * proc_id()
+        seed = self.seed # + 10000 * proc_id()
         torch.manual_seed(seed)
         np.random.seed(seed)
 
@@ -663,7 +732,6 @@ if __name__ == '__main__':
     else:
         print("🚫 禁用MPI模式: 使用单进程训练")
 
-    from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
     ppo(lambda : gym.make(args.env), actor_critic=MLPActorCritic,
