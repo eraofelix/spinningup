@@ -4,8 +4,7 @@ from torch.optim import Adam
 import gymnasium as gym
 import gymnasium_robotics
 import time
-# from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
-# from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
+# MPI imports will be done conditionally when needed
 from torch.utils.tensorboard import SummaryWriter
 import os
 import os.path as osp
@@ -283,6 +282,7 @@ class PPOBuffer:
         self.ptr, self.path_start_idx = 0, 0
         # the next two lines implement the advantage normalization trick
         if use_mpi:
+            from spinup.utils.mpi_tools import mpi_statistics_scalar
             adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
         else:
             adv_mean, adv_std = np.mean(self.adv_buf), np.std(self.adv_buf)
@@ -404,6 +404,10 @@ class PPOAgent:
     def _setup_environment(self):
         """Setup environment and related components"""
         if self.use_mpi:
+            # Import MPI modules only when needed
+            from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi
+            from spinup.utils.mpi_tools import proc_id
+            
             # Special function to avoid certain slowdowns from PyTorch + MPI combo.
             print(f"🔧 进程 {proc_id()}: 开始设置 PyTorch MPI...")
             try:
@@ -470,7 +474,9 @@ class PPOAgent:
             'kl': [],
             'entropy': [],
             'clip_frac': [],
-            'stop_iter': []
+            'stop_iter': [],
+            'gpu_times': [],  # GPU计算时间
+            'cpu_times': []   # CPU环境交互时间
         }
 
         # Random seed
@@ -494,20 +500,32 @@ class PPOAgent:
 
         # Sync params across processes (only if using MPI)
         if self.use_mpi:
+            from spinup.utils.mpi_pytorch import sync_params
             sync_params(self.ac)
 
         # Count variables (only for first process or single process mode)
-        if not self.use_mpi or proc_id() == 0:
+        if not self.use_mpi:
+            # Single process mode
             var_counts = tuple(count_vars(module) for module in [self.ac.pi, self.ac.v])
             print(f'\nNumber of parameters: pi: {var_counts[0]}, v: {var_counts[1]}')
-            print("=" * 120)
-            print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | Early Stop")
-            print("=" * 120)
+            print("=" * 180)
+            print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | Early Stop | GPU Time | CPU Time | GPU Memory")
+            print("=" * 180)
+        else:
+            # MPI mode
+            from spinup.utils.mpi_tools import proc_id
+            if proc_id() == 0:
+                var_counts = tuple(count_vars(module) for module in [self.ac.pi, self.ac.v])
+                print(f'\nNumber of parameters: pi: {var_counts[0]}, v: {var_counts[1]}')
+                print("=" * 180)
+                print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | Early Stop | GPU Time | CPU Time | GPU Memory")
+                print("=" * 180)
 
     def _setup_training_components(self):
         """Setup training components"""
         # Set up experience buffer
         if self.use_mpi:
+            from spinup.utils.mpi_tools import num_procs
             self.local_steps_per_epoch = int(self.steps_per_epoch / num_procs())
         else:
             self.local_steps_per_epoch = self.steps_per_epoch
@@ -559,6 +577,11 @@ class PPOAgent:
 
     def _update(self):
         """Perform PPO update"""
+        # 测量GPU训练时间
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+        gpu_train_start = time.time()
+        
         data = self.buf.get(self.use_mpi)
 
         pi_l_old, pi_info_old = self._compute_loss_pi(data)
@@ -570,6 +593,7 @@ class PPOAgent:
             self.pi_optimizer.zero_grad()
             loss_pi, pi_info = self._compute_loss_pi(data)
             if self.use_mpi:
+                from spinup.utils.mpi_tools import mpi_avg
                 kl = mpi_avg(pi_info['kl'])
             else:
                 kl = pi_info['kl']
@@ -577,6 +601,7 @@ class PPOAgent:
                 break
             loss_pi.backward()
             if self.use_mpi:
+                from spinup.utils.mpi_pytorch import mpi_avg_grads
                 mpi_avg_grads(self.ac.pi)    # average grads across MPI processes
             self.pi_optimizer.step()
 
@@ -586,8 +611,17 @@ class PPOAgent:
             loss_v = self._compute_loss_v(data)
             loss_v.backward()
             if self.use_mpi:
+                from spinup.utils.mpi_pytorch import mpi_avg_grads
                 mpi_avg_grads(self.ac.v)    # average grads across MPI processes
             self.vf_optimizer.step()
+
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+        gpu_train_end = time.time()
+        gpu_train_time = gpu_train_end - gpu_train_start
+        
+        # 记录GPU训练时间
+        self.epoch_metrics['gpu_times'].append(self.epoch_metrics['gpu_times'][-1] + gpu_train_time)
 
         # Log changes from update
         kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
@@ -603,27 +637,46 @@ class PPOAgent:
     def _log_epoch_info(self, epoch, start_time):
         """Log epoch information"""
         # Print epoch info (only for first process or single process mode)
-        if not self.use_mpi or proc_id() == 0:
-            # 计算平均值
-            ep_return = np.mean(self.epoch_metrics['ep_returns']) if self.epoch_metrics['ep_returns'] else 0.0
-            policy_loss = np.mean(self.epoch_metrics['loss_pi']) if self.epoch_metrics['loss_pi'] else 0.0
-            value_loss = np.mean(self.epoch_metrics['loss_v']) if self.epoch_metrics['loss_v'] else 0.0
-            kl_div = np.mean(self.epoch_metrics['kl']) if self.epoch_metrics['kl'] else 0.0
-            entropy = np.mean(self.epoch_metrics['entropy']) if self.epoch_metrics['entropy'] else 0.0
-            
-            # 检查是否有早停
-            early_stop = np.mean(self.epoch_metrics['stop_iter']) if self.epoch_metrics['stop_iter'] else 0.0
-            early_stop_flag = "True" if early_stop < self.train_pi_iters - 1 else "False"
-            
-            # GPU性能监控
-            gpu_info = ""
-            if self.device.type == 'cuda':
-                gpu_memory = torch.cuda.memory_allocated() / 1024**2
-                gpu_max_memory = torch.cuda.max_memory_allocated() / 1024**2
-                gpu_info = f" | GPU: {gpu_memory:.1f}MB/{gpu_max_memory:.1f}MB"
-            
-            # 单行打印，严格对齐
-            print(f"Epoch {epoch:4d} | Return: {ep_return:8.2f} | Policy Loss: {policy_loss:8.4f} | Value Loss: {value_loss:8.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:8.4f} | Early Stop: {early_stop_flag:5s}{gpu_info}")
+        if not self.use_mpi:
+            # Single process mode
+            self._print_epoch_info(epoch, start_time)
+        else:
+            # MPI mode
+            from spinup.utils.mpi_tools import proc_id
+            if proc_id() == 0:
+                self._print_epoch_info(epoch, start_time)
+    
+    def _print_epoch_info(self, epoch, start_time):
+        """Print epoch information"""
+        # 计算平均值
+        ep_return = np.mean(self.epoch_metrics['ep_returns']) if self.epoch_metrics['ep_returns'] else 0.0
+        policy_loss = np.mean(self.epoch_metrics['loss_pi']) if self.epoch_metrics['loss_pi'] else 0.0
+        value_loss = np.mean(self.epoch_metrics['loss_v']) if self.epoch_metrics['loss_v'] else 0.0
+        kl_div = np.mean(self.epoch_metrics['kl']) if self.epoch_metrics['kl'] else 0.0
+        entropy = np.mean(self.epoch_metrics['entropy']) if self.epoch_metrics['entropy'] else 0.0
+        
+        # 检查是否有早停
+        early_stop = np.mean(self.epoch_metrics['stop_iter']) if self.epoch_metrics['stop_iter'] else 0.0
+        early_stop_flag = "True" if early_stop < self.train_pi_iters - 1 else "False"
+        
+        # GPU性能监控和时间统计
+        gpu_info = ""
+        if self.device.type == 'cuda':
+            gpu_memory = torch.cuda.memory_allocated() / 1024**2
+            gpu_max_memory = torch.cuda.max_memory_allocated() / 1024**2
+            gpu_info = f" | GPU: {gpu_memory:.1f}MB/{gpu_max_memory:.1f}MB"
+        
+        # 时间统计
+        gpu_time = self.epoch_metrics['gpu_times'][-1] if self.epoch_metrics['gpu_times'] else 0.0
+        cpu_time = self.epoch_metrics['cpu_times'][-1] if self.epoch_metrics['cpu_times'] else 0.0
+        total_time = gpu_time + cpu_time
+        gpu_ratio = (gpu_time / total_time * 100) if total_time > 0 else 0
+        cpu_ratio = (cpu_time / total_time * 100) if total_time > 0 else 0
+        
+        time_info = f" | GPU: {gpu_time:.2f}s({gpu_ratio:.1f}%) | CPU: {cpu_time:.2f}s({cpu_ratio:.1f}%)"
+        
+        # 单行打印，严格对齐
+        print(f"Epoch {epoch:4d} | Return: {ep_return:8.2f} | Policy Loss: {policy_loss:8.4f} | Value Loss: {value_loss:8.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:8.4f} | Early Stop: {early_stop_flag:5s}{time_info}{gpu_info}")
         
         # 记录到 TensorBoard
         # 基本训练指标
@@ -663,6 +716,17 @@ class PPOAgent:
         if self.epoch_metrics['stop_iter']:
             self.tb_writer.add_scalar('Training/StopIterations', np.mean(self.epoch_metrics['stop_iter']), epoch)
         
+        # 记录时间统计
+        if self.epoch_metrics['gpu_times']:
+            self.tb_writer.add_scalar('Performance/GPU_Time', self.epoch_metrics['gpu_times'][-1], epoch)
+        if self.epoch_metrics['cpu_times']:
+            self.tb_writer.add_scalar('Performance/CPU_Time', self.epoch_metrics['cpu_times'][-1], epoch)
+        
+        # 记录GPU内存使用
+        if self.device.type == 'cuda':
+            gpu_memory = torch.cuda.memory_allocated() / 1024**2
+            self.tb_writer.add_scalar('Performance/GPU_Memory_MB', gpu_memory, epoch)
+        
         # 清空当前 epoch 的数据，为下一个 epoch 做准备
         for key in self.epoch_metrics:
             self.epoch_metrics[key] = []
@@ -690,12 +754,31 @@ class PPOAgent:
             batch_values = []
             batch_logps = []
             
+            # 时间统计变量
+            epoch_gpu_time = 0.0
+            epoch_cpu_time = 0.0
+            
             for t in range(self.local_steps_per_epoch):
+                # GPU计算时间测量
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()  # 确保GPU操作完成
+                gpu_start = time.time()
+                
                 # Move observation to device
                 obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
                 a, v, logp = self.ac.step(obs_tensor)
+                
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()  # 确保GPU操作完成
+                gpu_end = time.time()
+                epoch_gpu_time += (gpu_end - gpu_start)
 
+                # CPU环境交互时间测量
+                cpu_start = time.time()
                 next_o, r, terminated, truncated, _ = self.env.step(a)
+                cpu_end = time.time()
+                epoch_cpu_time += (cpu_end - cpu_start)
+                
                 d = terminated or truncated
                 ep_ret += r
                 ep_len += 1
@@ -717,8 +800,16 @@ class PPOAgent:
                         print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                     # if trajectory didn't reach terminal state, bootstrap value target
                     if timeout or epoch_ended:
+                        # GPU计算时间测量
+                        if self.device.type == 'cuda':
+                            torch.cuda.synchronize()
+                        gpu_start = time.time()
                         obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
                         _, v, _ = self.ac.step(obs_tensor)
+                        if self.device.type == 'cuda':
+                            torch.cuda.synchronize()
+                        gpu_end = time.time()
+                        epoch_gpu_time += (gpu_end - gpu_start)
                     else:
                         v = 0
                     self.buf.finish_path(v)
@@ -728,6 +819,10 @@ class PPOAgent:
                         self.epoch_metrics['ep_lengths'].append(ep_len)
                     o, _ = self.env.reset()
                     ep_ret, ep_len = 0, 0
+            
+            # 记录时间统计
+            self.epoch_metrics['gpu_times'].append(epoch_gpu_time)
+            self.epoch_metrics['cpu_times'].append(epoch_cpu_time)
 
             # Save model
             if (epoch % self.save_freq == 0) or (epoch == self.epochs-1):
@@ -791,6 +886,7 @@ if __name__ == '__main__':
         device = 'cpu'
     
     if use_mpi:
+        from spinup.utils.mpi_tools import mpi_fork
         mpi_fork(args.cpu)  # run parallel code with mpi
     else:
         print("🚫 禁用MPI模式: 使用单进程训练")
