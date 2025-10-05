@@ -4,12 +4,145 @@ from torch.optim import Adam
 import gymnasium as gym
 import gymnasium_robotics
 import time
-import spinup.algos.pytorch.ppo.core as core
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 from torch.utils.tensorboard import SummaryWriter
 import os
+import scipy.signal
+from gymnasium.spaces import Box, Discrete
+import torch.nn as nn
+from torch.distributions.normal import Normal
+from torch.distributions.categorical import Categorical
 
+
+def combined_shape(length, shape=None):
+    if shape is None:
+        return (length,)
+    return (length, shape) if np.isscalar(shape) else (length, *shape)
+
+
+def mlp(sizes, activation, output_activation=nn.Identity):
+    layers = []
+    for j in range(len(sizes)-1):
+        act = activation if j < len(sizes)-2 else output_activation
+        layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
+    return nn.Sequential(*layers)
+
+
+def count_vars(module):
+    return sum([np.prod(p.shape) for p in module.parameters()])
+
+
+def discount_cumsum(x, discount):
+    """
+    magic from rllab for computing discounted cumulative sums of vectors.
+
+    input: 
+        vector x, 
+        [x0, 
+         x1, 
+         x2]
+
+    output:
+        [x0 + discount * x1 + discount^2 * x2,  
+         x1 + discount * x2,
+         x2]
+    """
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+
+
+class Actor(nn.Module):
+
+    def _distribution(self, obs):
+        raise NotImplementedError
+
+    def _log_prob_from_distribution(self, pi, act):
+        raise NotImplementedError
+
+    def forward(self, obs, act=None):
+        # Produce action distributions for given observations, and 
+        # optionally compute the log likelihood of given actions under
+        # those distributions.
+        pi = self._distribution(obs)
+        logp_a = None
+        if act is not None:
+            logp_a = self._log_prob_from_distribution(pi, act)
+        return pi, logp_a
+
+
+class MLPCategoricalActor(Actor):
+    
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+        super().__init__()
+        self.logits_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
+
+    def _distribution(self, obs):
+        logits = self.logits_net(obs)
+        return Categorical(logits=logits)
+
+    def _log_prob_from_distribution(self, pi, act):
+        return pi.log_prob(act)
+
+
+class MLPGaussianActor(Actor):
+
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+        super().__init__()
+        log_std = -0.5 * np.ones(act_dim, dtype=np.float32)
+        self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
+        self.mu_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
+
+    def _distribution(self, obs):
+        mu = self.mu_net(obs)
+        std = torch.exp(self.log_std)
+        return Normal(mu, std)
+
+    def _log_prob_from_distribution(self, pi, act):
+        return pi.log_prob(act).sum(axis=-1)    # Last axis sum needed for Torch Normal distribution
+
+
+class MLPCritic(nn.Module):
+
+    def __init__(self, obs_dim, hidden_sizes, activation):
+        super().__init__()
+        self.v_net = mlp([obs_dim] + list(hidden_sizes) + [1], activation)
+
+    def forward(self, obs):
+        return torch.squeeze(self.v_net(obs), -1) # Critical to ensure v has right shape.
+
+
+class MLPActorCritic(nn.Module):
+
+    def __init__(self, observation_space, action_space, 
+                 hidden_sizes=(64,64), activation=nn.Tanh):
+        super().__init__()
+
+        obs_dim = observation_space.shape[0]
+
+        # policy builder depends on action space
+        if isinstance(action_space, Box):
+            self.pi = MLPGaussianActor(obs_dim, action_space.shape[0], hidden_sizes, activation)
+        elif isinstance(action_space, Discrete):
+            self.pi = MLPCategoricalActor(obs_dim, action_space.n, hidden_sizes, activation)
+
+        # build value function
+        self.v  = MLPCritic(obs_dim, hidden_sizes, activation)
+
+    def step(self, obs):
+        with torch.no_grad():
+            pi = self.pi._distribution(obs)
+            a = pi.sample()
+            logp_a = self.pi._log_prob_from_distribution(pi, a)
+            v = self.v(obs)
+        return a.numpy(), v.numpy(), logp_a.numpy()
+
+    def act(self, obs):
+        return self.step(obs)[0]
+
+
+# ============================================================================
+# PPO Buffer and Agent classes
+# ============================================================================
 
 class PPOBuffer:
     """
@@ -19,8 +152,8 @@ class PPOBuffer:
     """
 
     def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
-        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
-        self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        self.obs_buf = np.zeros(combined_shape(size, obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros(combined_shape(size, act_dim), dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.ret_buf = np.zeros(size, dtype=np.float32)
@@ -63,10 +196,10 @@ class PPOBuffer:
         
         # the next two lines implement GAE-Lambda advantage calculation
         deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
-        self.adv_buf[path_slice] = core.discount_cumsum(deltas, self.gamma * self.lam)
+        self.adv_buf[path_slice] = discount_cumsum(deltas, self.gamma * self.lam)
         
         # the next line computes rewards-to-go, to be targets for the value function
-        self.ret_buf[path_slice] = core.discount_cumsum(rews, self.gamma)[:-1]
+        self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[:-1]
         
         self.path_start_idx = self.ptr
 
@@ -93,7 +226,7 @@ class PPOAgent:
     with early stopping based on approximate KL
     """
     
-    def __init__(self, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+    def __init__(self, env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
                  target_kl=0.05, logger_kwargs=dict(), save_freq=100):
@@ -253,7 +386,7 @@ class PPOAgent:
 
         # Count variables (only for first process)
         if proc_id() == 0:
-            var_counts = tuple(core.count_vars(module) for module in [self.ac.pi, self.ac.v])
+            var_counts = tuple(count_vars(module) for module in [self.ac.pi, self.ac.v])
             print(f'\nNumber of parameters: pi: {var_counts[0]}, v: {var_counts[1]}')
             print("=" * 120)
             print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | Early Stop")
@@ -462,7 +595,7 @@ class PPOAgent:
         self.tb_writer.close()
 
 
-def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
         target_kl=0.05, logger_kwargs=dict(), save_freq=100):
@@ -501,7 +634,7 @@ if __name__ == '__main__':
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    ppo(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
+    ppo(lambda : gym.make(args.env), actor_critic=MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
