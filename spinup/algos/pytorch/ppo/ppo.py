@@ -218,39 +218,47 @@ class PPOBuffer:
     A buffer for storing trajectories experienced by a PPO agent interacting
     with the environment, and using Generalized Advantage Estimation (GAE-Lambda)
     for calculating the advantages of state-action pairs.
+    
+    使用轨迹列表方案，无需维护指针，逻辑更简单。
     """
 
     def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
-        self.obs_buf = np.zeros(combined_shape(size, obs_dim), dtype=np.float32)
-        self.act_buf = np.zeros(combined_shape(size, act_dim), dtype=np.float32)
-        self.adv_buf = np.zeros(size, dtype=np.float32)
-        self.rew_buf = np.zeros(size, dtype=np.float32)
-        self.ret_buf = np.zeros(size, dtype=np.float32)
-        self.val_buf = np.zeros(size, dtype=np.float32)
-        self.logp_buf = np.zeros(size, dtype=np.float32)
         self.gamma, self.lam = gamma, lam
-        self.ptr, self.path_start_idx, self.max_size = 0, 0, size
+        self.max_size = size
+        
+        # 使用轨迹列表，无需指针管理
+        self.trajectories = []  # 存储完整轨迹
+        self.current_traj = None  # 当前正在构建的轨迹
+        self.total_steps = 0  # 总步数计数器
 
     def store(self, obs, act, rew, val, logp):
         """
         Append one timestep of agent-environment interaction to the buffer.
         """
-        assert self.ptr < self.max_size     # buffer has to have room so you can store
-        self.obs_buf[self.ptr] = obs
-        self.act_buf[self.ptr] = act
-        self.rew_buf[self.ptr] = rew
-        self.val_buf[self.ptr] = val
-        self.logp_buf[self.ptr] = logp
-        self.ptr += 1
+        # 检查是否还有空间
+        if self.total_steps >= self.max_size:
+            return  # 缓冲区已满，忽略新数据
+        
+        # 如果当前轨迹为空，创建新轨迹
+        if self.current_traj is None:
+            self.current_traj = {
+                'obs': [], 'act': [], 'rew': [], 'val': [], 'logp': []
+            }
+        
+        # 存储数据到当前轨迹
+        self.current_traj['obs'].append(obs)
+        self.current_traj['act'].append(act)
+        self.current_traj['rew'].append(rew)
+        self.current_traj['val'].append(val)
+        self.current_traj['logp'].append(logp)
+        
+        self.total_steps += 1
 
     def finish_path(self, last_val=0):
         """
         Call this at the end of a trajectory, or when one gets cut off
-        by an epoch ending. This looks back in the buffer to where the
-        trajectory started, and uses rewards and value estimates from
-        the whole trajectory to compute advantage estimates with GAE-Lambda,
-        as well as compute the rewards-to-go for each state, to use as
-        the targets for the value function.
+        by an epoch ending. This computes advantage estimates with GAE-Lambda
+        and rewards-to-go for the current trajectory.
 
         The "last_val" argument should be 0 if the trajectory ended
         because the agent reached a terminal state (died), and otherwise
@@ -258,38 +266,64 @@ class PPOBuffer:
         This allows us to bootstrap the reward-to-go calculation to account
         for timesteps beyond the arbitrary episode horizon (or epoch cutoff).
         """
-
-        path_slice = slice(self.path_start_idx, self.ptr)
-        rews = np.append(self.rew_buf[path_slice], last_val)
-        vals = np.append(self.val_buf[path_slice], last_val)
+        if self.current_traj is None or len(self.current_traj['obs']) == 0:
+            return  # 没有数据需要处理
         
-        # the next two lines implement GAE-Lambda advantage calculation
+        # 获取当前轨迹数据
+        rews = np.array(self.current_traj['rew'] + [last_val])
+        vals = np.array(self.current_traj['val'] + [last_val])
+        
+        # 计算GAE-Lambda优势函数
         deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
-        self.adv_buf[path_slice] = discount_cumsum(deltas, self.gamma * self.lam)
+        adv = discount_cumsum(deltas, self.gamma * self.lam)
         
-        # the next line computes rewards-to-go, to be targets for the value function
-        self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[:-1]
+        # 计算回报 (rewards-to-go)
+        ret = discount_cumsum(rews, self.gamma)[:-1]
         
-        self.path_start_idx = self.ptr
+        # 将计算结果添加到轨迹中
+        self.current_traj['adv'] = adv
+        self.current_traj['ret'] = ret
+        
+        # 保存完整轨迹
+        self.trajectories.append(self.current_traj)
+        self.current_traj = None  # 重置当前轨迹
 
     def get(self, use_mpi=True):
         """
         Call this at the end of an epoch to get all of the data from
         the buffer, with advantages appropriately normalized (shifted to have
-        mean zero and std one). Also, resets some pointers in the buffer.
+        mean zero and std one). Also, resets the buffer.
         """
-        assert self.ptr == self.max_size    # buffer has to be full before you can get
-        self.ptr, self.path_start_idx = 0, 0
-        # the next two lines implement the advantage normalization trick
+        if not self.trajectories:
+            return {}  # 没有轨迹数据
+        
+        # 合并所有轨迹数据
+        all_obs = np.concatenate([t['obs'] for t in self.trajectories])
+        all_act = np.concatenate([t['act'] for t in self.trajectories])
+        all_ret = np.concatenate([t['ret'] for t in self.trajectories])
+        all_adv = np.concatenate([t['adv'] for t in self.trajectories])
+        all_logp = np.concatenate([t['logp'] for t in self.trajectories])
+        
+        # 归一化优势函数
         if use_mpi:
             from spinup.utils.mpi_tools import mpi_statistics_scalar
-            adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
+            adv_mean, adv_std = mpi_statistics_scalar(all_adv)
         else:
-            adv_mean, adv_std = np.mean(self.adv_buf), np.std(self.adv_buf)
-        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
-        data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
-                    adv=self.adv_buf, logp=self.logp_buf)
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
+            adv_mean, adv_std = np.mean(all_adv), np.std(all_adv)
+        all_adv = (all_adv - adv_mean) / adv_std
+        
+        # 清空轨迹和重置计数器
+        self.trajectories = []
+        self.current_traj = None
+        self.total_steps = 0
+        
+        return {
+            'obs': torch.as_tensor(all_obs, dtype=torch.float32),
+            'act': torch.as_tensor(all_act, dtype=torch.float32),
+            'ret': torch.as_tensor(all_ret, dtype=torch.float32),
+            'adv': torch.as_tensor(all_adv, dtype=torch.float32),
+            'logp': torch.as_tensor(all_logp, dtype=torch.float32)
+        }
 
 
 class PPOAgent:
@@ -561,13 +595,16 @@ class PPOAgent:
         return loss_pi, pi_info
 
     def _compute_loss_v(self, data):
-        """Compute value function loss"""
+        """Compute value function loss
+        让价值函数逼近目标价值，目标价值是通过GAE (Generalized Advantage Estimation) 计算的：
+        self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[:-1]
+        """
         obs, ret = data['obs'], data['ret']
         
         # Move data to device
         obs = obs.to(self.device)
         ret = ret.to(self.device)
-        
+
         return ((self.ac.v(obs) - ret)**2).mean()
 
     def _save_model(self, epoch):
@@ -747,19 +784,10 @@ class PPOAgent:
 
         # Main loop: collect experience in env and update/log each epoch
         for epoch in range(self.epochs):
-            # 批量收集数据以提高GPU效率
-            batch_obs = []
-            batch_actions = []
-            batch_rewards = []
-            batch_values = []
-            batch_logps = []
-            
-            # 时间统计变量
             epoch_gpu_time = 0.0
             epoch_cpu_time = 0.0
             
             for t in range(self.local_steps_per_epoch):
-                # GPU计算时间测量
                 if self.device.type == 'cuda':
                     torch.cuda.synchronize()  # 确保GPU操作完成
                 gpu_start = time.time()
@@ -779,7 +807,7 @@ class PPOAgent:
                 cpu_end = time.time()
                 epoch_cpu_time += (cpu_end - cpu_start)
                 
-                d = terminated or truncated
+                d = terminated or truncated  # 环境终止: 自然终止 OR 截断终止
                 ep_ret += r
                 ep_len += 1
 
@@ -791,27 +819,32 @@ class PPOAgent:
                 # Update obs (critical!)
                 o = next_o
 
-                timeout = ep_len == self.max_ep_len
-                terminal = d or timeout
-                epoch_ended = t==self.local_steps_per_epoch-1
+                timeout = ep_len == self.max_ep_len  # 达到最大步数限制
+                terminal = d or timeout  # 轨迹结束: 自然终止 OR 超时终止
+                epoch_ended = t==self.local_steps_per_epoch-1  # 当前epoch结束
 
                 if terminal or epoch_ended:
                     if epoch_ended and not(terminal) and (not self.use_mpi or proc_id() == 0):
                         print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                     # if trajectory didn't reach terminal state, bootstrap value target
-                    if timeout or epoch_ended:
+                    if timeout or epoch_ended:  # 情况1: 轨迹被截断，需要引导价值
+                        # 逻辑: (timeout=True) OR (epoch_ended=True) 
+                        # 说明: 轨迹被强制结束，还有未来奖励，需要估计当前状态价值
                         # GPU计算时间测量
                         if self.device.type == 'cuda':
                             torch.cuda.synchronize()
                         gpu_start = time.time()
                         obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
-                        _, v, _ = self.ac.step(obs_tensor)
+                        _, v, _ = self.ac.step(obs_tensor)  # 获取引导价值V(s_T)
                         if self.device.type == 'cuda':
                             torch.cuda.synchronize()
                         gpu_end = time.time()
                         epoch_gpu_time += (gpu_end - gpu_start)
-                    else:
-                        v = 0
+                    else:  # 情况2: 自然终止，不需要引导价值，HalfCheetah-v5里不存在，但其他环境可能存在
+                        # 逻辑: (terminated=True) AND (truncated=False) AND (timeout=False) AND (epoch_ended=False)
+                        # 说明: 任务真正结束(如智能体死亡、到达目标)，没有未来奖励
+                        v = 0  # 自然终止时价值为0
+                        print("自然终止")
                     self.buf.finish_path(v)
                     if terminal:
                         # 记录到 TensorBoard 指标中
