@@ -203,7 +203,8 @@ class MLPActorCritic(nn.Module):
             a = pi.sample()
             logp_a = self.pi._log_prob_from_distribution(pi, a)
             v = self.v(obs)
-        return a.numpy(), v.numpy(), logp_a.numpy()
+        # Move tensors to CPU before converting to numpy
+        return a.cpu().numpy(), v.cpu().numpy(), logp_a.cpu().numpy()
 
     def act(self, obs):
         return self.step(obs)[0]
@@ -301,7 +302,7 @@ class PPOAgent:
     def __init__(self, env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-                 target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True):
+                 target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True, device=None):
         """
         Initialize PPO Agent
         
@@ -373,6 +374,27 @@ class PPOAgent:
         self.logger_kwargs = logger_kwargs
         self.save_freq = save_freq
         self.use_mpi = use_mpi
+        
+        # Setup device (GPU/CPU)
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+                print(f"🚀 使用GPU加速: {torch.cuda.get_device_name(0)}")
+                print(f"🔧 GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+                # 启用GPU优化
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cudnn.deterministic = False
+                print("⚡ 启用GPU优化: CUDNN benchmark")
+            else:
+                self.device = torch.device('cpu')
+                print("💻 使用CPU训练")
+        else:
+            self.device = torch.device(device)
+            print(f"🎯 使用指定设备: {self.device}")
+            if self.device.type == 'cuda':
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cudnn.deterministic = False
+                print("⚡ 启用GPU优化: CUDNN benchmark")
         
         # Initialize components
         self._setup_environment()
@@ -465,6 +487,10 @@ class PPOAgent:
         """Setup actor-critic agent"""
         # Create actor-critic module
         self.ac = self.actor_critic(self.env.observation_space, self.env.action_space, **self.ac_kwargs)
+        
+        # Move model to device (GPU/CPU)
+        self.ac = self.ac.to(self.device)
+        print(f"📱 模型已移动到设备: {self.device}")
 
         # Sync params across processes (only if using MPI)
         if self.use_mpi:
@@ -494,6 +520,12 @@ class PPOAgent:
     def _compute_loss_pi(self, data):
         """Compute PPO policy loss"""
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
+        
+        # Move data to device
+        obs = obs.to(self.device)
+        act = act.to(self.device)
+        adv = adv.to(self.device)
+        logp_old = logp_old.to(self.device)
 
         # Policy loss
         pi, logp = self.ac.pi(obs, act)
@@ -513,6 +545,11 @@ class PPOAgent:
     def _compute_loss_v(self, data):
         """Compute value function loss"""
         obs, ret = data['obs'], data['ret']
+        
+        # Move data to device
+        obs = obs.to(self.device)
+        ret = ret.to(self.device)
+        
         return ((self.ac.v(obs) - ret)**2).mean()
 
     def _save_model(self, epoch):
@@ -578,8 +615,15 @@ class PPOAgent:
             early_stop = np.mean(self.epoch_metrics['stop_iter']) if self.epoch_metrics['stop_iter'] else 0.0
             early_stop_flag = "True" if early_stop < self.train_pi_iters - 1 else "False"
             
+            # GPU性能监控
+            gpu_info = ""
+            if self.device.type == 'cuda':
+                gpu_memory = torch.cuda.memory_allocated() / 1024**2
+                gpu_max_memory = torch.cuda.max_memory_allocated() / 1024**2
+                gpu_info = f" | GPU: {gpu_memory:.1f}MB/{gpu_max_memory:.1f}MB"
+            
             # 单行打印，严格对齐
-            print(f"Epoch {epoch:4d} | Return: {ep_return:8.2f} | Policy Loss: {policy_loss:8.4f} | Value Loss: {value_loss:8.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:8.4f} | Early Stop: {early_stop_flag:5s}")
+            print(f"Epoch {epoch:4d} | Return: {ep_return:8.2f} | Policy Loss: {policy_loss:8.4f} | Value Loss: {value_loss:8.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:8.4f} | Early Stop: {early_stop_flag:5s}{gpu_info}")
         
         # 记录到 TensorBoard
         # 基本训练指标
@@ -639,8 +683,17 @@ class PPOAgent:
 
         # Main loop: collect experience in env and update/log each epoch
         for epoch in range(self.epochs):
+            # 批量收集数据以提高GPU效率
+            batch_obs = []
+            batch_actions = []
+            batch_rewards = []
+            batch_values = []
+            batch_logps = []
+            
             for t in range(self.local_steps_per_epoch):
-                a, v, logp = self.ac.step(torch.as_tensor(o, dtype=torch.float32))
+                # Move observation to device
+                obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
+                a, v, logp = self.ac.step(obs_tensor)
 
                 next_o, r, terminated, truncated, _ = self.env.step(a)
                 d = terminated or truncated
@@ -664,7 +717,8 @@ class PPOAgent:
                         print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                     # if trajectory didn't reach terminal state, bootstrap value target
                     if timeout or epoch_ended:
-                        _, v, _ = self.ac.step(torch.as_tensor(o, dtype=torch.float32))
+                        obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
+                        _, v, _ = self.ac.step(obs_tensor)
                     else:
                         v = 0
                     self.buf.finish_path(v)
@@ -692,7 +746,7 @@ class PPOAgent:
 def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True):
+        target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True, device=None):
     """
     Proximal Policy Optimization (by clipping) function for backward compatibility
     
@@ -700,7 +754,7 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
     """
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
-                    lam, max_ep_len, target_kl, logger_kwargs, save_freq, use_mpi)
+                    lam, max_ep_len, target_kl, logger_kwargs, save_freq, use_mpi, device)
     agent.train()
 
 
@@ -722,10 +776,19 @@ if __name__ == '__main__':
     parser.add_argument('--train_v_iters', type=int, default=80, help='价值网络训练迭代次数')
     parser.add_argument('--target_kl', type=float, default=0.01, help='KL散度目标值（更保守）')
     parser.add_argument('--no-mpi', action='store_true', help='禁用MPI，使用单进程模式')
+    parser.add_argument('--device', type=str, default=None, help='指定设备 (cuda/cpu/auto)')
     args = parser.parse_args()
 
     # 根据参数决定是否使用MPI
     use_mpi = not args.no_mpi
+    
+    # 处理设备参数
+    device = args.device
+    if device == 'auto':
+        device = None  # 让代码自动检测
+    elif device == 'cuda' and not torch.cuda.is_available():
+        print("⚠️  CUDA不可用，回退到CPU")
+        device = 'cpu'
     
     if use_mpi:
         mpi_fork(args.cpu)  # run parallel code with mpi
@@ -739,4 +802,4 @@ if __name__ == '__main__':
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
         train_v_iters=args.train_v_iters, target_kl=args.target_kl,
-        logger_kwargs=logger_kwargs, use_mpi=use_mpi)
+        logger_kwargs=logger_kwargs, use_mpi=use_mpi, device=device)
