@@ -772,6 +772,10 @@ class PPOAgent:
             self.tb_writer.add_scalar('Reward/Episode_Return', np.mean(self.epoch_metrics['ep_returns']), epoch)
             if len(self.epoch_metrics['ep_returns']) > 1:
                 self.tb_writer.add_scalar('Reward/Episode_Return_Std', np.std(self.epoch_metrics['ep_returns']), epoch)
+            else:
+                print(f"ep_returns={self.epoch_metrics['ep_returns']}")
+        else:
+            print(f"ep_returns={self.epoch_metrics['ep_returns']}")
         
         # 记录回合长度
         if self.epoch_metrics['ep_lengths']:
@@ -829,7 +833,7 @@ class PPOAgent:
         ep_ret, ep_len = 0, 0
 
         # Main loop: collect experience in env and update/log each epoch
-        num_debug_epochs = 0
+        num_debug_epochs = 1
         num_debug_steps = 0
 
         for epoch in range(self.epochs):
@@ -923,10 +927,10 @@ class PPOAgent:
                     self.buf.finish_path(v)  # (obs, act, rew, val, logp) -> (obs, act, ret, adv, logp, adv, ret)
                     if epoch < num_debug_epochs and t < num_debug_steps:
                         print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} finish_path")
-                    if terminal:
+                    # if terminal:
                         # 记录到 TensorBoard 指标中
-                        self.epoch_metrics['ep_returns'].append(ep_ret)
-                        self.epoch_metrics['ep_lengths'].append(ep_len)
+                    self.epoch_metrics['ep_returns'].append(ep_ret)
+                    self.epoch_metrics['ep_lengths'].append(ep_len)
                     o, _ = self.env.reset()
                     if epoch < num_debug_epochs and t < num_debug_steps:
                         print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} reset")
