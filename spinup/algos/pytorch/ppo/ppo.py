@@ -15,7 +15,8 @@ from torch.distributions.normal import Normal
 from torch.distributions.categorical import Categorical
 
 # Constants moved from user_config.py
-DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'data')
+DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
+
 FORCE_DATESTAMP = False
 
 
@@ -185,7 +186,16 @@ class MLPActorCritic(nn.Module):
                  hidden_sizes=(64,64), activation=nn.Tanh):
         super().__init__()
 
-        obs_dim = observation_space.shape[0]
+        # 处理不同的观察空间类型
+        if len(observation_space.shape) == 1:
+            # 向量观察空间 (如 HalfCheetah)
+            obs_dim = observation_space.shape[0]
+        elif len(observation_space.shape) == 3:
+            # 图像观察空间 (如 CarRacing)
+            # 将图像展平: 96*96*3 = 27648
+            obs_dim = np.prod(observation_space.shape)
+        else:
+            raise ValueError(f"不支持的观察空间维度: {observation_space.shape}")
 
         # policy builder depends on action space
         if isinstance(action_space, Box):
@@ -198,6 +208,12 @@ class MLPActorCritic(nn.Module):
 
     def step(self, obs):
         with torch.no_grad():
+            # 处理图像观察: 展平图像
+            if len(obs.shape) == 3:  # 图像观察 (H, W, C)
+                obs = obs.flatten()  # 展平为 (H*W*C,)
+            elif len(obs.shape) == 4:  # 批量图像观察 (B, H, W, C)
+                obs = obs.view(obs.size(0), -1)  # 展平为 (B, H*W*C)
+            
             pi = self.pi._distribution(obs)
             a = pi.sample()
             logp_a = self.pi._log_prob_from_distribution(pi, a)
@@ -273,12 +289,21 @@ class PPOBuffer:
         rews = np.array(self.current_traj['rew'] + [last_val])
         vals = np.array(self.current_traj['val'] + [last_val])
         
-        # 计算GAE-Lambda优势函数
-        deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
-        adv = discount_cumsum(deltas, self.gamma * self.lam)
+        # 计算GAE-Lambda优势函数:                                      
+        deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]      # 单步 δ_t = r_t + γV(s_{t+1}) - V(s_t) 
+        # 假如deltas=[d0, d1, d2, d3, d4, d5] 长度为6
+        # 那么adv=[a0, a1, a2, a3, a4, a5] 注意，这里adv和deltas长度相同
+        # a0 = d0 + γλ * d1 + (γλ)^2 * d2 + (γλ)^3 * d3 + (γλ)^4 * d4 + (γλ)^5 * d5
+        # a1 = d1 + γλ * d2 + (γλ)^2 * d3 + (γλ)^3 * d4 + (γλ)^4 * d5
+        # a2 = d2 + γλ * d3 + (γλ)^2 * d4 + (γλ)^3 * d5
+        # a3 = d3 + γλ * d4 + (γλ)^2 * d5
+        # a4 = d4 + γλ * d5
+        # a5 = d5
+        # A_t = Σ_{k=0}^{∞} (γλ)^k δ_{t+k} = δ_{t} + γλ * δ_{t+1} + (γλ)^2 * δ_{t+2} + (γλ)^3 * δ_{t+3} + (γλ)^4 * δ_{t+4} + (γλ)^5 * δ_{t+5}
+        adv = discount_cumsum(deltas, self.gamma * self.lam)  # 长度为6，与deltas相同
         
         # 计算回报 (rewards-to-go)
-        ret = discount_cumsum(rews, self.gamma)[:-1]
+        ret = discount_cumsum(rews, self.gamma)[:-1]    # 长度为6，与rews相同
         
         # 将计算结果添加到轨迹中
         self.current_traj['adv'] = adv
@@ -514,7 +539,7 @@ class PPOAgent:
         }
 
         # Random seed
-        seed = self.seed # + 10000 * proc_id()
+        seed = self.seed + 10000 * proc_id() if self.use_mpi else self.seed
         torch.manual_seed(seed)
         np.random.seed(seed)
 
@@ -824,6 +849,7 @@ class PPOAgent:
                 epoch_ended = t==self.local_steps_per_epoch-1  # 当前epoch结束
 
                 if terminal or epoch_ended:
+                    from spinup.utils.mpi_tools import proc_id
                     if epoch_ended and not(terminal) and (not self.use_mpi or proc_id() == 0):
                         print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                     # if trajectory didn't reach terminal state, bootstrap value target
@@ -845,7 +871,7 @@ class PPOAgent:
                         # 说明: 任务真正结束(如智能体死亡、到达目标)，没有未来奖励
                         v = 0  # 自然终止时价值为0
                         print("自然终止")
-                    self.buf.finish_path(v)
+                    self.buf.finish_path(v)  # (obs, act, rew, val, logp) -> (obs, act, ret, adv, logp, adv, ret)
                     if terminal:
                         # 记录到 TensorBoard 指标中
                         self.epoch_metrics['ep_returns'].append(ep_ret)
