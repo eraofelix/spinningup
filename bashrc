@@ -36,4 +36,4 @@ fi
 source /etc/profile
 source /etc/autodl-motd
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate mpi
+conda activate rl

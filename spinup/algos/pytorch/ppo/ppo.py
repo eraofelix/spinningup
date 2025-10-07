@@ -365,7 +365,8 @@ class PPOAgent:
     def __init__(self, env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-                 target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True, device=None):
+                 target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True, device=None,
+                 min_steps_per_proc=None):
         """
         Initialize PPO Agent
         
@@ -437,6 +438,7 @@ class PPOAgent:
         self.logger_kwargs = logger_kwargs
         self.save_freq = save_freq
         self.use_mpi = use_mpi
+        self.min_steps_per_proc = min_steps_per_proc
         
         # Setup device (GPU/CPU)
         if device is None:
@@ -602,7 +604,44 @@ class PPOAgent:
         # Set up experience buffer
         if self.use_mpi:
             from spinup.utils.mpi_tools import num_procs
-            self.local_steps_per_epoch = int(self.steps_per_epoch / num_procs())
+            # 更合理的步数分配：确保每个进程有足够的步数收集完整轨迹
+            num_procs_val = num_procs()
+            
+            # 根据环境类型智能调整最小步数
+            if self.min_steps_per_proc is not None:
+                # 用户指定了最小步数
+                min_steps_per_proc = self.min_steps_per_proc
+            elif hasattr(self.env, 'spec') and self.env.spec.id:
+                env_name = self.env.spec.id.lower()
+                if 'car' in env_name or 'racing' in env_name:
+                    # 赛车环境需要更多步数
+                    min_steps_per_proc = max(self.max_ep_len * 3, 2000)
+                elif 'mujoco' in env_name or 'gym' in env_name:
+                    # MuJoCo环境相对较短
+                    min_steps_per_proc = max(self.max_ep_len * 2, 1000)
+                else:
+                    # 默认设置
+                    min_steps_per_proc = max(self.max_ep_len * 2, 1000)
+            else:
+                # 基于观测空间类型判断
+                if len(self.env.observation_space.shape) == 3:
+                    # 图像环境（如CarRacing）需要更多步数
+                    min_steps_per_proc = max(self.max_ep_len * 3, 2000)
+                else:
+                    # 向量环境
+                    min_steps_per_proc = max(self.max_ep_len * 2, 1000)
+            
+            # 计算实际步数分配
+            base_steps_per_proc = int(self.steps_per_epoch / num_procs_val)
+            self.local_steps_per_epoch = max(base_steps_per_proc, min_steps_per_proc)
+            
+            # 如果调整后总步数增加，给出警告
+            total_adjusted_steps = self.local_steps_per_epoch * num_procs_val
+            if total_adjusted_steps > self.steps_per_epoch:
+                print(f"⚠️  步数调整: 原计划={self.steps_per_epoch}, 调整后={total_adjusted_steps}")
+                print(f"🔧 进程步数分配: 总步数={total_adjusted_steps}, 进程数={num_procs_val}, 每进程步数={self.local_steps_per_epoch}")
+            else:
+                print(f"🔧 进程步数分配: 总步数={self.steps_per_epoch}, 进程数={num_procs_val}, 每进程步数={self.local_steps_per_epoch}")
         else:
             self.local_steps_per_epoch = self.steps_per_epoch
         self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam)
@@ -957,7 +996,8 @@ class PPOAgent:
 def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True, device=None):
+        target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True, device=None,
+        min_steps_per_proc=None):
     """
     Proximal Policy Optimization (by clipping) function for backward compatibility
     
@@ -965,7 +1005,8 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
     """
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
-                    lam, max_ep_len, target_kl, logger_kwargs, save_freq, use_mpi, device)
+                    lam, max_ep_len, target_kl, logger_kwargs, save_freq, use_mpi, device,
+                    min_steps_per_proc)
     agent.train()
 
 
@@ -999,6 +1040,8 @@ if __name__ == '__main__':
                        help='注意力机制reduction参数')
     parser.add_argument('--dropout_rate', type=float, default=0.1, 
                        help='Dropout比率')
+    parser.add_argument('--min_steps_per_proc', type=int, default=None,
+                       help='每个进程的最小步数，用于避免轨迹截断')
     args = parser.parse_args()
 
     # 根据参数决定是否使用MPI
@@ -1053,4 +1096,5 @@ if __name__ == '__main__':
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
         train_v_iters=args.train_v_iters, target_kl=args.target_kl,
-        logger_kwargs=logger_kwargs, use_mpi=use_mpi, device=device)
+        logger_kwargs=logger_kwargs, use_mpi=use_mpi, device=device,
+        min_steps_per_proc=args.min_steps_per_proc)
