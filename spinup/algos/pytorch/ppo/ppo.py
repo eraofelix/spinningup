@@ -829,23 +829,36 @@ class PPOAgent:
         ep_ret, ep_len = 0, 0
 
         # Main loop: collect experience in env and update/log each epoch
+        num_debug_epochs = 10
+        num_debug_steps = 1e10
+
         for epoch in range(self.epochs):
+            if epoch < num_debug_epochs:
+                print(f"Epoch {epoch} start")
             epoch_gpu_time = 0.0
             epoch_cpu_time = 0.0
             
             for t in range(self.local_steps_per_epoch):
+                if epoch < num_debug_epochs and t < num_debug_steps:
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} start")
                 if self.device.type == 'cuda':
                     torch.cuda.synchronize()  # 确保GPU操作完成
                 gpu_start = time.time()
                 
                 # Move observation to device
                 obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
+                if epoch < num_debug_epochs and t < num_debug_steps:
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} obs {o.shape}")
                 a, v, logp = self.ac.step(obs_tensor)
+                if epoch < num_debug_epochs and t < num_debug_steps:
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} action {a} value {v} logp {logp}")
                 
                 if self.device.type == 'cuda':
                     torch.cuda.synchronize()  # 确保GPU操作完成
                 gpu_end = time.time()
                 epoch_gpu_time += (gpu_end - gpu_start)
+                if epoch < num_debug_epochs and t < num_debug_steps:
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} gpu time {gpu_end - gpu_start}")
 
                 # CPU环境交互时间测量
                 cpu_start = time.time()
@@ -855,15 +868,21 @@ class PPOAgent:
                 else:
                     action_for_env = a
                 next_o, r, terminated, truncated, _ = self.env.step(action_for_env)
+                if epoch < num_debug_epochs and t < num_debug_steps:
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} next_o {next_o.shape} r {r} terminated {terminated} truncated {truncated}")
                 cpu_end = time.time()
                 epoch_cpu_time += (cpu_end - cpu_start)
                 
                 d = terminated or truncated  # 环境终止: 自然终止 OR 截断终止
                 ep_ret += r
                 ep_len += 1
+                if epoch < num_debug_epochs and t < num_debug_steps:
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} ep_ret {ep_ret} ep_len {ep_len}")
 
                 # save and log
                 self.buf.store(o, a, r, v, logp)
+                if epoch < num_debug_epochs and t < num_debug_steps:
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} store")
                 # 记录价值估计到 TensorBoard 指标中
                 self.epoch_metrics['v_vals'].append(v)
                 
@@ -873,11 +892,13 @@ class PPOAgent:
                 timeout = ep_len == self.max_ep_len  # 达到最大步数限制
                 terminal = d or timeout  # 轨迹结束: 自然终止 OR 超时终止
                 epoch_ended = t==self.local_steps_per_epoch-1  # 当前epoch结束
+                if epoch < num_debug_epochs and t < num_debug_steps:
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} timeout {timeout} terminal {terminal} epoch_ended {epoch_ended}")
 
                 if terminal or epoch_ended:
-                    from spinup.utils.mpi_tools import proc_id
-                    if epoch_ended and not(terminal) and (not self.use_mpi or proc_id() == 0):
-                        print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
+                    # from spinup.utils.mpi_tools import proc_id
+                    # if epoch_ended and not(terminal) and (not self.use_mpi or proc_id() == 0):
+                    #     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                     # if trajectory didn't reach terminal state, bootstrap value target
                     if timeout or epoch_ended:  # 情况1: 轨迹被截断，需要引导价值
                         # 逻辑: (timeout=True) OR (epoch_ended=True) 
@@ -888,6 +909,8 @@ class PPOAgent:
                         gpu_start = time.time()
                         obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
                         _, v, _ = self.ac.step(obs_tensor)  # 获取引导价值V(s_T)
+                        if epoch < num_debug_epochs and t < num_debug_steps:
+                            print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} v {v}")
                         if self.device.type == 'cuda':
                             torch.cuda.synchronize()
                         gpu_end = time.time()
@@ -898,11 +921,15 @@ class PPOAgent:
                         v = 0  # 自然终止时价值为0
                         print("自然终止")
                     self.buf.finish_path(v)  # (obs, act, rew, val, logp) -> (obs, act, ret, adv, logp, adv, ret)
+                    if epoch < num_debug_epochs and t < num_debug_steps:
+                        print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} finish_path")
                     if terminal:
                         # 记录到 TensorBoard 指标中
                         self.epoch_metrics['ep_returns'].append(ep_ret)
                         self.epoch_metrics['ep_lengths'].append(ep_len)
                     o, _ = self.env.reset()
+                    if epoch < num_debug_epochs and t < num_debug_steps:
+                        print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} reset")
                     ep_ret, ep_len = 0, 0
             
             # 记录时间统计

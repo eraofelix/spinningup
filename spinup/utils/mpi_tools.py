@@ -65,6 +65,9 @@ def mpi_sum(x):
 
 def mpi_avg(x):
     """Average a scalar or vector over MPI processes."""
+    # 如果是PyTorch张量，先移动到CPU
+    if hasattr(x, 'cpu'):
+        x = x.cpu()
     return mpi_sum(x) / num_procs()
     
 def mpi_statistics_scalar(x, with_min_and_max=False):

@@ -22,8 +22,10 @@ def mpi_avg_grads(module):
     if num_procs()==1:
         return
     for p in module.parameters():
-        p_grad_numpy = p.grad.numpy()   # numpy view of tensor data
-        avg_p_grad = mpi_avg(p.grad)
+        # 确保梯度在CPU上，然后转换为numpy
+        p_grad_cpu = p.grad.cpu()
+        p_grad_numpy = p_grad_cpu.numpy()   # numpy view of tensor data
+        avg_p_grad = mpi_avg(p_grad_cpu)
         p_grad_numpy[:] = avg_p_grad[:]
 
 def sync_params(module):
@@ -31,5 +33,7 @@ def sync_params(module):
     if num_procs()==1:
         return
     for p in module.parameters():
-        p_numpy = p.data.numpy()
+        # 确保参数在CPU上，然后转换为numpy
+        p_cpu = p.data.cpu()
+        p_numpy = p_cpu.numpy()
         broadcast(p_numpy)
