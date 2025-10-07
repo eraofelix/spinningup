@@ -186,16 +186,7 @@ class MLPActorCritic(nn.Module):
                  hidden_sizes=(64,64), activation=nn.Tanh):
         super().__init__()
 
-        # 处理不同的观察空间类型
-        if len(observation_space.shape) == 1:
-            # 向量观察空间 (如 HalfCheetah)
-            obs_dim = observation_space.shape[0]
-        elif len(observation_space.shape) == 3:
-            # 图像观察空间 (如 CarRacing)
-            # 将图像展平: 96*96*3 = 27648
-            obs_dim = np.prod(observation_space.shape)
-        else:
-            raise ValueError(f"不支持的观察空间维度: {observation_space.shape}")
+        obs_dim = observation_space.shape[0]
 
         # policy builder depends on action space
         if isinstance(action_space, Box):
@@ -208,12 +199,6 @@ class MLPActorCritic(nn.Module):
 
     def step(self, obs):
         with torch.no_grad():
-            # 处理图像观察: 展平图像
-            if len(obs.shape) == 3:  # 图像观察 (H, W, C)
-                obs = obs.flatten()  # 展平为 (H*W*C,)
-            elif len(obs.shape) == 4:  # 批量图像观察 (B, H, W, C)
-                obs = obs.view(obs.size(0), -1)  # 展平为 (B, H*W*C)
-            
             pi = self.pi._distribution(obs)
             a = pi.sample()
             logp_a = self.pi._log_prob_from_distribution(pi, a)
@@ -603,6 +588,11 @@ class PPOAgent:
         act = act.to(self.device)
         adv = adv.to(self.device)
         logp_old = logp_old.to(self.device)
+
+        # Handle image observations: flatten if needed
+        if len(obs.shape) > 2:  # 批量图像数据 (B, H, W, C)
+            batch_size = obs.shape[0]
+            obs = obs.view(batch_size, -1)  # 展平为 (B, H*W*C)
 
         # Policy loss
         pi, logp = self.ac.pi(obs, act)
