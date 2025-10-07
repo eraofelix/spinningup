@@ -227,6 +227,10 @@ class PPOBuffer:
         self.gamma, self.lam = gamma, lam
         self.max_size = size
         
+        # 存储观测维度信息
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        
         # 使用轨迹列表，无需指针管理
         self.trajectories = []  # 存储完整轨迹
         self.current_traj = None  # 当前正在构建的轨迹
@@ -246,12 +250,21 @@ class PPOBuffer:
                 'obs': [], 'act': [], 'rew': [], 'val': [], 'logp': []
             }
         
-        # 存储数据到当前轨迹
+        # 存储数据到当前轨迹，确保数据类型一致
         self.current_traj['obs'].append(obs)
         self.current_traj['act'].append(act)
-        self.current_traj['rew'].append(rew)
-        self.current_traj['val'].append(val)
-        self.current_traj['logp'].append(logp)
+        # 确保奖励是标量
+        if hasattr(rew, 'item'):
+            rew = rew.item()
+        self.current_traj['rew'].append(float(rew))
+        # 确保价值是标量
+        if hasattr(val, 'item'):
+            val = val.item()
+        self.current_traj['val'].append(float(val))
+        # 确保对数概率是标量
+        if hasattr(logp, 'item'):
+            logp = logp.item()
+        self.current_traj['logp'].append(float(logp))
         
         self.total_steps += 1
 
@@ -270,7 +283,11 @@ class PPOBuffer:
         if self.current_traj is None or len(self.current_traj['obs']) == 0:
             return  # 没有数据需要处理
         
-        # 获取当前轨迹数据
+        # 获取当前轨迹数据，确保last_val是标量
+        if hasattr(last_val, 'item'):
+            last_val = last_val.item()
+        last_val = float(last_val)
+        
         rews = np.array(self.current_traj['rew'] + [last_val])
         vals = np.array(self.current_traj['val'] + [last_val])
         
@@ -313,6 +330,8 @@ class PPOBuffer:
         all_ret = np.concatenate([t['ret'] for t in self.trajectories])
         all_adv = np.concatenate([t['adv'] for t in self.trajectories])
         all_logp = np.concatenate([t['logp'] for t in self.trajectories])
+        
+        all_obs = all_obs.astype(np.float32)
         
         # 归一化优势函数
         if use_mpi:
@@ -442,8 +461,11 @@ class PPOAgent:
         
         # Initialize components
         self._setup_environment()
+        print("🔧 _setup_environment done")
         self._setup_agent()
+        print("🔧 _setup_agent done")
         self._setup_training_components()
+        print("🔧 _setup_training_components done")
     
     def _setup_environment(self):
         """Setup environment and related components"""
@@ -530,8 +552,18 @@ class PPOAgent:
 
         # Instantiate environment
         self.env = self.env_fn()
-        self.obs_dim = self.env.observation_space.shape
-        self.act_dim = self.env.action_space.shape
+        
+        # Handle different observation spaces
+        if len(self.env.observation_space.shape) == 3:
+            # Image observations (H, W, C) - for CNN
+            self.obs_dim = self.env.observation_space.shape
+            print(f"🖼️  检测到图像观测空间: {self.obs_dim}")
+        else:
+            # Vector observations
+            self.obs_dim = self.env.observation_space.shape[0]
+            print(f"📊 检测到向量观测空间: {self.obs_dim}")
+        
+        self.act_dim = self.env.action_space.shape if hasattr(self.env.action_space, 'shape') else (self.env.action_space.n,)
 
     def _setup_agent(self):
         """Setup actor-critic agent"""
@@ -589,10 +621,9 @@ class PPOAgent:
         adv = adv.to(self.device)
         logp_old = logp_old.to(self.device)
 
-        # Handle image observations: flatten if needed
-        if len(obs.shape) > 2:  # 批量图像数据 (B, H, W, C)
-            batch_size = obs.shape[0]
-            obs = obs.view(batch_size, -1)  # 展平为 (B, H*W*C)
+        # Handle image observations: keep as images for CNN
+        # CNN networks expect image format (B, C, H, W) or (B, H, W, C)
+        # No flattening needed for CNN-based networks
 
         # Policy loss
         pi, logp = self.ac.pi(obs, act)
@@ -818,7 +849,12 @@ class PPOAgent:
 
                 # CPU环境交互时间测量
                 cpu_start = time.time()
-                next_o, r, terminated, truncated, _ = self.env.step(a)
+                # 确保动作是正确的形状：从 (1, 3) 转换为 (3,)
+                if len(a.shape) > 1 and a.shape[0] == 1:
+                    action_for_env = a[0]  # 取第一个（也是唯一的）动作
+                else:
+                    action_for_env = a
+                next_o, r, terminated, truncated, _ = self.env.step(action_for_env)
                 cpu_end = time.time()
                 epoch_cpu_time += (cpu_end - cpu_start)
                 
@@ -921,6 +957,17 @@ if __name__ == '__main__':
     parser.add_argument('--target_kl', type=float, default=0.01, help='KL散度目标值（更保守）')
     parser.add_argument('--no-mpi', action='store_true', help='禁用MPI，使用单进程模式')
     parser.add_argument('--device', type=str, default=None, help='指定设备 (cuda/cpu/auto)')
+    
+    # CNN网络参数控制
+    parser.add_argument('--feature_dim', type=int, default=256, help='CNN特征维度')
+    parser.add_argument('--cnn_channels', type=int, nargs=4, default=[16, 32, 64, 128], 
+                       help='CNN各层通道数 [conv1, conv2, conv3, conv4]')
+    parser.add_argument('--hidden_sizes', type=int, nargs='+', default=[128, 64], 
+                       help='全连接层隐藏层大小')
+    parser.add_argument('--attention_reduction', type=int, default=8, 
+                       help='注意力机制reduction参数')
+    parser.add_argument('--dropout_rate', type=float, default=0.1, 
+                       help='Dropout比率')
     args = parser.parse_args()
 
     # 根据参数决定是否使用MPI
@@ -942,8 +989,36 @@ if __name__ == '__main__':
 
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    ppo(lambda : gym.make(args.env), actor_critic=MLPActorCritic,
-        ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
+    # 根据环境类型选择网络架构
+    env_test = gym.make(args.env)
+    if len(env_test.observation_space.shape) == 3:
+        # 图像观测，使用CNN
+        print("🖼️  检测到图像观测，使用CNN网络")
+        try:
+            from cnn_attention import CNNActorCritic
+        except ImportError:
+            # 如果相对导入失败，尝试绝对导入
+            import sys
+            import os
+            sys.path.append(os.path.dirname(__file__))
+            from cnn_attention import CNNActorCritic
+        actor_critic = CNNActorCritic
+        ac_kwargs = dict(
+            feature_dim=args.feature_dim,
+            hidden_sizes=args.hidden_sizes,
+            cnn_channels=args.cnn_channels,
+            attention_reduction=args.attention_reduction,
+            dropout_rate=args.dropout_rate
+        )
+    else:
+        # 向量观测，使用MLP
+        print("📊 检测到向量观测，使用MLP网络")
+        actor_critic = MLPActorCritic
+        ac_kwargs = dict(hidden_sizes=[args.hid]*args.l)
+    env_test.close()
+
+    ppo(lambda : gym.make(args.env), actor_critic=actor_critic,
+        ac_kwargs=ac_kwargs, gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
         train_v_iters=args.train_v_iters, target_kl=args.target_kl,
