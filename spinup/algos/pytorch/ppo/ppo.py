@@ -829,8 +829,8 @@ class PPOAgent:
         ep_ret, ep_len = 0, 0
 
         # Main loop: collect experience in env and update/log each epoch
-        num_debug_epochs = 10
-        num_debug_steps = 1e10
+        num_debug_epochs = 0
+        num_debug_steps = 0
 
         for epoch in range(self.epochs):
             if epoch < num_debug_epochs:
