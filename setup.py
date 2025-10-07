@@ -27,7 +27,12 @@ setup(
         'scipy',
         'seaborn==0.8.1',
         # ß'torch==1.3.1',
-        'tqdm'
+        'tqdm',
+        'gymnasium',
+        'gymnasium_robotics',
+        'tensorboard',
+        'swig',
+        'gymnasium[box2d]'
     ],
     description="Teaching tools for introducing people to deep RL.",
     author="Joshua Achiam",
