@@ -16,6 +16,7 @@ import torch.nn as nn
 from torch.distributions.normal import Normal
 from torch.distributions.categorical import Categorical
 import torch.nn.functional as F
+from gymnasium.wrappers import FrameStackObservation as FrameStack
 
 DEFAULT_DATA_DIR = "/root/tf-logs" if osp.exists("/root/tf-logs") else osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
 FORCE_DATESTAMP = False
@@ -92,8 +93,9 @@ class TanhNormal:
 
 class SimpleSharedCNN(nn.Module):
     """
-    Lightweight CNN for 96x96x3 inputs. No BN/Dropout/Attention.
+    Lightweight CNN for 96x96 inputs with configurable channels. No BN/Dropout/Attention.
     Outputs a feature vector of size feature_dim.
+    Supports FrameStack: RGB(3) -> RGB+Stack(12) or Grayscale(1) -> Grayscale+Stack(4)
     """
     def __init__(self, in_channels=3, feature_dim=256):
         super().__init__()
@@ -117,7 +119,7 @@ class SimpleSharedCNN(nn.Module):
         self.feature_dim = feature_dim
 
     def forward(self, x):
-        # x: (B, C=3, H=96, W=96) or (C=3, H, W) or (B, H, W, C) or (H, W, C)
+        # x: (B, C, H, W) or (C, H, W) or (B, H, W, C) or (H, W, C) or (stack_size, H, W, C) or (B, stack_size, H, W, C)
         if x.dim() == 3:
             # 判断是 (C, H, W) 还是 (H, W, C)
             if x.shape[0] == 3:  # (C, H, W)
@@ -125,11 +127,27 @@ class SimpleSharedCNN(nn.Module):
             else:  # (H, W, C)
                 x = x.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
         elif x.dim() == 4:
-            # 判断是 (B, C, H, W) 还是 (B, H, W, C)
+            # 判断是 (B, C, H, W) 还是 (B, H, W, C) 还是 (stack_size, H, W, C)
             if x.shape[1] == 3:  # (B, C, H, W)
                 pass  # 已经是正确格式
-            else:  # (B, H, W, C)
-                x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
+            elif x.shape[-1] == 3:  # (B, H, W, C) 或 (stack_size, H, W, C)
+                # 需要重新排列为 (B, C, H, W) 或 (stack_size*C, H, W)
+                if x.shape[0] == 4 and x.shape[1] == 96:  # FrameStack: (4, H, W, C)
+                    # FrameStack情况: (4, H, W, C) -> (1, 4*C, H, W)
+                    x = x.permute(0, 3, 1, 2)  # (4, C, H, W)
+                    x = x.reshape(1, x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (1, 4*C, H, W)
+                else:  # 普通情况: (B, H, W, C)
+                    x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
+            else:
+                # 其他情况，尝试智能处理
+                if x.shape[-1] in [1, 3]:  # 最后一维是通道
+                    x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
+        elif x.dim() == 5:
+            # 处理批量FrameStack: (B, stack_size, H, W, C)
+            batch_size, stack_size, h, w, c = x.shape
+            # 重塑为 (B, stack_size*C, H, W)
+            x = x.permute(0, 1, 4, 2, 3)  # (B, stack_size, C, H, W)
+            x = x.reshape(batch_size, stack_size * c, h, w)  # (B, stack_size*C, H, W)
         
         # ensure float32 in [0,1]
         if x.dtype != torch.float32:
@@ -183,7 +201,7 @@ class CNNActorCriticShared(nn.Module):
     """
     def __init__(self, observation_space, action_space,
                  feature_dim=256, actor_hidden=(256,128), critic_hidden=(256,128),
-                 car_racing_mode=True):
+                 car_racing_mode=True, use_framestack=True):
         super().__init__()
         self.obs_space = observation_space
         self.act_space = action_space
@@ -191,8 +209,23 @@ class CNNActorCriticShared(nn.Module):
         self.is_discrete = isinstance(action_space, Discrete)
         assert self.is_box or self.is_discrete, "Unsupported action space"
 
+        # 根据观测空间确定输入通道数
+        if len(observation_space.shape) == 4:  # FrameStack后的形状 (stack_size, H, W, C)
+            # FrameStack后的观测空间
+            stack_size, h, w, c = observation_space.shape
+            in_channels = stack_size * c  # 总通道数 = 堆叠数 × 单帧通道数
+        elif len(observation_space.shape) == 3:  # 单帧图像观测 (H, W, C)
+            # 单帧图像观测
+            if observation_space.shape[-1] == 3:  # RGB
+                in_channels = 3
+            else:  # 灰度
+                in_channels = 1
+        else:
+            in_channels = 3  # 默认RGB
+        
+        print(f"🔧 CNN输入通道数: {in_channels} (FrameStack: {use_framestack})")
+        
         # Shared CNN
-        in_channels = 3  # RGB
         self.encoder = SimpleSharedCNN(in_channels=in_channels, feature_dim=feature_dim)
 
         if self.is_box:
@@ -663,6 +696,12 @@ class PPOAgent:
         # Instantiate environment
         self.env = self.env_fn()
         
+        # 为CarRacing环境添加FrameStack
+        if hasattr(self.env, 'spec') and self.env.spec and 'CarRacing' in self.env.spec.id:
+            print("🏎️  检测到CarRacing环境，添加FrameStack(4)包装器")
+            self.env = FrameStack(self.env, stack_size=4)
+            print(f"📊 FrameStack后观测空间: {self.env.observation_space}")
+        
         # Handle different observation spaces
         if len(self.env.observation_space.shape) == 3:
             # Image observations (H, W, C) - for CNN
@@ -1102,7 +1141,8 @@ if __name__ == '__main__':
             feature_dim=args.feature_dim,
             actor_hidden=args.hidden_sizes,
             critic_hidden=args.hidden_sizes,
-            car_racing_mode=True
+            car_racing_mode=True,
+            use_framestack=True  # 启用FrameStack
         )
     else:
         # 向量观测，使用MLP
