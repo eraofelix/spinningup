@@ -508,7 +508,7 @@ class PPOBuffer:
         # all_obs = all_obs.astype(np.float32)
         
         # 统计GAE数值（规范化前）- 每10个epoch打印一次
-        from spinup.utils.mpi_tools import proc_id
+        
         if proc_id() == 0:
             # 获取当前epoch信息（从训练循环中传递）
             current_epoch = getattr(self, '_current_epoch', 0)
@@ -517,7 +517,7 @@ class PPOBuffer:
         
         # 对优势函数进行轻裁剪（winsorize），抑制长尾样本
         all_adv = np.clip(all_adv, -self.adv_clip_range, self.adv_clip_range)
-        from spinup.utils.mpi_tools import proc_id
+        
         if proc_id() == 0:
             current_epoch = getattr(self, '_current_epoch', 0)
             if current_epoch % 10 == 0:
@@ -531,7 +531,7 @@ class PPOBuffer:
         if adv_std < 0.95:
             boost_factor = 1.2
             all_adv = all_adv * boost_factor
-            from spinup.utils.mpi_tools import proc_id
+            
             if proc_id() == 0:
                 current_epoch = getattr(self, '_current_epoch', 0)
                 if current_epoch % 10 == 0:
@@ -559,7 +559,7 @@ class PPOBuffer:
     
     def _print_gae_statistics(self, adv, ret, deltas):
         """打印GAE统计信息（仅在进程0打印）"""
-        from spinup.utils.mpi_tools import proc_id
+        
         if proc_id() != 0:
             return
             
@@ -605,7 +605,7 @@ class PPOBuffer:
     
     def _print_normalized_adv_statistics(self, adv_normalized):
         """打印规范化后的优势函数统计（仅在进程0打印）"""
-        from spinup.utils.mpi_tools import proc_id
+        
         if proc_id() != 0:
             return
             
@@ -623,7 +623,7 @@ class PPOBuffer:
 
 class PPOAgent:
     def __init__(self, env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
-                 steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.1, pi_lr=3e-4,
+                 steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.15, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
                  target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
 
@@ -798,7 +798,7 @@ class PPOAgent:
         self.vf_optimizer = Adam(self.ac.v.parameters(), lr=self.vf_lr)
 
         self.minibatch_size = 2048  # 如果总样本少于 2048，可设为 512 或 1024
-        self.policy_epochs = 3
+        self.policy_epochs = 5
         self.value_epochs = 4
 
         self.kl_history = []
@@ -945,10 +945,22 @@ class PPOAgent:
             recent_kl = np.mean(self.kl_history[-3:])
             recent_cf = np.mean(self.cf_history[-3:])
             new_lr = None
-            if (recent_kl < 0.5 * self.target_kl) and (recent_cf < 0.1):
+            
+            # 上调条件：连续3个epoch mean_KL < 0.5×target_kl 且 clip_frac > 0.6
+            if (recent_kl < 0.5 * self.target_kl) and (recent_cf > 0.6):
                 new_lr = min(self.pi_lr * 1.5, 2e-4)
-            elif (recent_kl > 2.0 * self.target_kl) or (recent_cf > 0.4):
+                
+                if proc_id() == 0:
+                    print(f"📈 提升pi_lr: KL={recent_kl:.4f} < {0.5 * self.target_kl:.4f}, CF={recent_cf:.4f} > 0.6")
+                    print(f"   pi_lr: {self.pi_lr:.2e} -> {new_lr:.2e}")
+            # 下调条件：KL过大或CF过小
+            elif (recent_kl > 2.0 * self.target_kl) or (recent_cf < 0.1):
                 new_lr = max(self.pi_lr * 0.5, 1e-5)
+                
+                if proc_id() == 0:
+                    print(f"📉 降低pi_lr: KL={recent_kl:.4f}, CF={recent_cf:.4f}")
+                    print(f"   pi_lr: {self.pi_lr:.2e} -> {new_lr:.2e}")
+            
             if new_lr is not None and abs(new_lr - self.pi_lr) / self.pi_lr > 0.01:
                 for g in self.pi_optimizer.param_groups:
                     g['lr'] = new_lr
@@ -1203,7 +1215,7 @@ class PPOAgent:
         self.tb_writer.close()
 
 def ppo(env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.1, pi_lr=3e-4,
+        steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.15, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=100,
         target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
