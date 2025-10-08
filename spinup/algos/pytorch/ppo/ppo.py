@@ -22,68 +22,6 @@ DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__fi
 FORCE_DATESTAMP = False
 
 
-def setup_logger_kwargs(exp_name, seed=None, data_dir=None, datestamp=False):
-    """
-    Sets up the output_dir for a logger and returns a dict for logger kwargs.
-
-    If no seed is given and datestamp is false, 
-
-    ::
-
-        output_dir = data_dir/exp_name
-
-    If a seed is given and datestamp is false,
-
-    ::
-
-        output_dir = data_dir/exp_name/exp_name_s[seed]
-
-    If datestamp is true, amend to
-
-    ::
-
-        output_dir = data_dir/YY-MM-DD_exp_name/YY-MM-DD_HH-MM-SS_exp_name_s[seed]
-
-    You can force datestamp=True by setting ``FORCE_DATESTAMP=True`` in 
-    ``spinup/user_config.py``. 
-
-    Args:
-
-        exp_name (string): Name for experiment.
-
-        seed (int): Seed for random number generators used by experiment.
-
-        data_dir (string): Path to folder where results should be saved.
-            Default is the ``DEFAULT_DATA_DIR`` in ``spinup/user_config.py``.
-
-        datestamp (bool): Whether to include a date and timestamp in the
-            name of the save directory.
-
-    Returns:
-
-        logger_kwargs, a dict containing output_dir and exp_name.
-    """
-
-    # Datestamp forcing
-    datestamp = datestamp or FORCE_DATESTAMP
-
-    # Make base path
-    ymd_time = time.strftime("%Y-%m-%d_") if datestamp else ''
-    relpath = ''.join([ymd_time, exp_name])
-    
-    if seed is not None:
-        # Make a seed-specific subfolder in the experiment directory.
-        if datestamp:
-            hms_time = time.strftime("%Y-%m-%d_%H-%M-%S")
-            subfolder = ''.join([hms_time, '-', exp_name, '_s', str(seed)])
-        else:
-            subfolder = ''.join([exp_name, '_s', str(seed)])
-        relpath = osp.join(relpath, subfolder)
-
-    data_dir = data_dir or DEFAULT_DATA_DIR
-    logger_kwargs = dict(output_dir=osp.join(data_dir, relpath), 
-                         exp_name=exp_name)
-    return logger_kwargs
 
 
 def combined_shape(length, shape=None):
@@ -363,58 +301,8 @@ class PPOAgent:
     def __init__(self, env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-                 target_kl=0.05, logger_kwargs=dict(), save_freq=100, device=None,
-                 min_steps_per_proc=None):
-        """
-        Initialize PPO Agent
-        
-        Args:
-            env_fn : A function which creates a copy of the environment.
-                The environment must satisfy the OpenAI Gym API.
+                 target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
 
-            actor_critic: The constructor method for a PyTorch Module with a 
-                ``step`` method, an ``act`` method, a ``pi`` module, and a ``v`` 
-                module.
-
-            ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
-                you provided to PPO.
-
-            seed (int): Seed for random number generators.
-
-            steps_per_epoch (int): Number of steps of interaction (state-action pairs) 
-                for the agent and the environment in each epoch.
-
-            epochs (int): Number of epochs of interaction (equivalent to
-                number of policy updates) to perform.
-
-            gamma (float): Discount factor. (Always between 0 and 1.)
-
-            clip_ratio (float): Hyperparameter for clipping in the policy objective.
-
-            pi_lr (float): Learning rate for policy optimizer.
-
-            vf_lr (float): Learning rate for value function optimizer.
-
-            train_pi_iters (int): Maximum number of gradient descent steps to take 
-                on policy loss per epoch.
-
-            train_v_iters (int): Number of gradient descent steps to take on 
-                value function per epoch.
-
-            lam (float): Lambda for GAE-Lambda. (Always between 0 and 1,
-                close to 1.)
-
-            max_ep_len (int): Maximum length of trajectory / episode / rollout.
-
-            target_kl (float): Roughly what KL divergence we think is appropriate
-                between new and old policies after an update.
-
-            logger_kwargs (dict): Keyword args for EpochLogger.
-
-            save_freq (int): How often (in terms of gap between epochs) to save
-                the current policy and value function.
-                
-        """
         # Store parameters
         self.env_fn = env_fn
         self.actor_critic = actor_critic
@@ -431,7 +319,6 @@ class PPOAgent:
         self.lam = lam
         self.max_ep_len = max_ep_len
         self.target_kl = target_kl
-        self.logger_kwargs = logger_kwargs
         self.save_freq = save_freq
         self.min_steps_per_proc = min_steps_per_proc
         
@@ -478,23 +365,15 @@ class PPOAgent:
         # 创建带时间戳的输出目录
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_dir = self.logger_kwargs['output_dir']
-        # 如果目录以 ppo_s0 结尾，替换为带时间戳的目录
-        if base_dir.endswith('ppo_s0'):
-            base_dir = base_dir.replace('ppo_s0', f'ppo_{timestamp}')
-        else:
-            # 如果目录不以 ppo_s0 结尾，在末尾添加时间戳
-            base_dir = f"{base_dir}_{timestamp}"
-        
-        # 更新 logger_kwargs 中的 output_dir
-        self.logger_kwargs['output_dir'] = base_dir
+        exp_name = f'ppo_{timestamp}'
+        self.output_dir = osp.join(DEFAULT_DATA_DIR, exp_name)
         
         # Set up TensorBoard writer
-        self.tb_writer = SummaryWriter(log_dir=self.logger_kwargs['output_dir'])
+        self.tb_writer = SummaryWriter(log_dir=self.output_dir)
         
         # Save configuration to JSON file
-        config_path = os.path.join(self.logger_kwargs['output_dir'], 'config.json')
-        os.makedirs(self.logger_kwargs['output_dir'], exist_ok=True)
+        config_path = os.path.join(self.output_dir, 'config.json')
+        os.makedirs(self.output_dir, exist_ok=True)
         import json
         
         # 只保存重要的配置参数，避免循环引用
@@ -664,7 +543,7 @@ class PPOAgent:
 
     def _save_model(self, epoch):
         """Save model at specified epoch"""
-        model_path = os.path.join(self.logger_kwargs['output_dir'], f'model_epoch_{epoch}.pth')
+        model_path = os.path.join(self.output_dir, f'model_epoch_{epoch}.pth')
         torch.save(self.ac.state_dict(), model_path)
 
     def _update(self):
@@ -726,14 +605,12 @@ class PPOAgent:
     
     def _print_epoch_info(self, epoch, start_time):
         """Print epoch information"""
-        # 计算平均值
+        # 计算平均值和统计信息
         ep_return = np.mean(self.epoch_metrics['ep_returns']) if self.epoch_metrics['ep_returns'] else 0.0
         policy_loss = np.mean(self.epoch_metrics['loss_pi']) if self.epoch_metrics['loss_pi'] else 0.0
         value_loss = np.mean(self.epoch_metrics['loss_v']) if self.epoch_metrics['loss_v'] else 0.0
         kl_div = np.mean(self.epoch_metrics['kl']) if self.epoch_metrics['kl'] else 0.0
         entropy = np.mean(self.epoch_metrics['entropy']) if self.epoch_metrics['entropy'] else 0.0
-        
-        # 检查是否有早停
         early_stop = np.mean(self.epoch_metrics['stop_iter']) if self.epoch_metrics['stop_iter'] else 0.0
         early_stop_flag = "True" if early_stop < self.train_pi_iters - 1 else "False"
         
@@ -743,8 +620,6 @@ class PPOAgent:
             gpu_memory = torch.cuda.memory_allocated() / 1024**2
             gpu_max_memory = torch.cuda.max_memory_allocated() / 1024**2
             gpu_info = f" | GPU: {gpu_memory:.1f}/{gpu_max_memory:.1f}MB"
-        
-        # 时间统计
         gpu_time = self.epoch_metrics['gpu_times'][-1] if self.epoch_metrics['gpu_times'] else 0.0
         cpu_time = self.epoch_metrics['cpu_times'][-1] if self.epoch_metrics['cpu_times'] else 0.0
         total_time = gpu_time + cpu_time
@@ -754,13 +629,12 @@ class PPOAgent:
         # 单行打印，严格对齐
         print(f"Epoch {epoch:4d} | Return: {ep_return:5.2f} | Policy Loss: {policy_loss:5.4f} | Value Loss: {value_loss:5.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:5.4f} | Early Stop: {early_stop_flag:5s}{time_info}{gpu_info}")
         
-        # 记录到 TensorBoard
-        # 基本训练指标
+        # 记录到 TensorBoard - 基本训练指标
         self.tb_writer.add_scalar('Training/Epoch', epoch, epoch)
         self.tb_writer.add_scalar('Training/Environment_Interactions', (epoch + 1) * self.steps_per_epoch, epoch)
         self.tb_writer.add_scalar('Training/Time', time.time() - start_time, epoch)
         
-        # 记录奖励
+        # 记录奖励和回合信息
         if self.epoch_metrics['ep_returns']:
             self.tb_writer.add_scalar('Reward/Episode_Return', np.mean(self.epoch_metrics['ep_returns']), epoch)
             if len(self.epoch_metrics['ep_returns']) > 1:
@@ -769,22 +643,16 @@ class PPOAgent:
                 print(f"ep_returns={self.epoch_metrics['ep_returns']}")
         else:
             print(f"ep_returns={self.epoch_metrics['ep_returns']}")
-        
-        # 记录回合长度
         if self.epoch_metrics['ep_lengths']:
             self.tb_writer.add_scalar('Episode/Length', np.mean(self.epoch_metrics['ep_lengths']), epoch)
         
-        # 记录价值估计
+        # 记录价值、损失和策略指标
         if self.epoch_metrics['v_vals']:
             self.tb_writer.add_scalar('Values/Value_Estimates', np.mean(self.epoch_metrics['v_vals']), epoch)
-        
-        # 记录损失
         if self.epoch_metrics['loss_pi']:
             self.tb_writer.add_scalar('Loss/Policy_Loss', np.mean(self.epoch_metrics['loss_pi']), epoch)
         if self.epoch_metrics['loss_v']:
             self.tb_writer.add_scalar('Loss/Value_Loss', np.mean(self.epoch_metrics['loss_v']), epoch)
-        
-        # 记录策略指标
         if self.epoch_metrics['kl']:
             self.tb_writer.add_scalar('Policy/KL_Divergence', np.mean(self.epoch_metrics['kl']), epoch)
         if self.epoch_metrics['entropy']:
@@ -792,30 +660,23 @@ class PPOAgent:
         if self.epoch_metrics['clip_frac']:
             self.tb_writer.add_scalar('Policy/ClipFraction', np.mean(self.epoch_metrics['clip_frac']), epoch)
         
-        # 记录训练指标
+        # 记录训练指标和时间统计
         if self.epoch_metrics['stop_iter']:
             self.tb_writer.add_scalar('Training/StopIterations', np.mean(self.epoch_metrics['stop_iter']), epoch)
-        
-        # 记录时间统计
         if self.epoch_metrics['gpu_times']:
             self.tb_writer.add_scalar('Performance/GPU_Time', self.epoch_metrics['gpu_times'][-1], epoch)
         if self.epoch_metrics['cpu_times']:
             self.tb_writer.add_scalar('Performance/CPU_Time', self.epoch_metrics['cpu_times'][-1], epoch)
-        
-        # 记录GPU内存使用
         if self.device.type == 'cuda':
             gpu_memory = torch.cuda.memory_allocated() / 1024**2
             self.tb_writer.add_scalar('Performance/GPU_Memory_MB', gpu_memory, epoch)
         
-        # 清空当前 epoch 的数据，为下一个 epoch 做准备
         for key in self.epoch_metrics:
             self.epoch_metrics[key] = []
         
-        # Log model parameters to TensorBoard
         if epoch % 10 == 0:  # Log every 10 epochs to avoid too much data
             for name, param in self.ac.named_parameters():
                 self.tb_writer.add_histogram(f'Model/{name}', param, epoch)
-        
         self.tb_writer.flush()
 
     def train(self):
@@ -893,10 +754,6 @@ class PPOAgent:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} timeout {timeout} terminal {terminal} epoch_ended {epoch_ended}")
 
                 if terminal or epoch_ended:
-                    # from spinup.utils.mpi_tools import proc_id
-                    # if epoch_ended and not(terminal) and (not self.use_mpi or proc_id() == 0):
-                    #     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
-                    # if trajectory didn't reach terminal state, bootstrap value target
                     if timeout or epoch_ended:  # 情况1: 轨迹被截断，需要引导价值
                         # 逻辑: (timeout=True) OR (epoch_ended=True) 
                         # 说明: 轨迹被强制结束，还有未来奖励，需要估计当前状态价值
@@ -950,17 +807,10 @@ class PPOAgent:
 def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.05, logger_kwargs=dict(), save_freq=100, device=None,
-        min_steps_per_proc=None):
-    """
-    Proximal Policy Optimization (by clipping) function for backward compatibility
-    
-    This function creates a PPOAgent and calls its train method.
-    """
+        target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
-                    lam, max_ep_len, target_kl, logger_kwargs, save_freq, device,
-                    min_steps_per_proc)
+                    lam, max_ep_len, target_kl, save_freq, device, min_steps_per_proc)
     agent.train()
 
 
@@ -1008,7 +858,6 @@ if __name__ == '__main__':
     
     mpi_fork(args.cpu)  # run parallel code with mpi
 
-    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
     # 根据环境类型选择网络架构
     env_test = gym.make(args.env)
@@ -1043,5 +892,5 @@ if __name__ == '__main__':
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
         train_v_iters=args.train_v_iters, target_kl=args.target_kl,
-        logger_kwargs=logger_kwargs, device=device,
+        device=device,
         min_steps_per_proc=args.min_steps_per_proc)
