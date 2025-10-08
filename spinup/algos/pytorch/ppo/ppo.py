@@ -16,12 +16,8 @@ import torch.nn as nn
 from torch.distributions.normal import Normal
 from torch.distributions.categorical import Categorical
 
-# Constants moved from user_config.py
-DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
-
+DEFAULT_DATA_DIR = "/root/tf-logs/" if osp.exists("/root/tf-logs") else osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
 FORCE_DATESTAMP = False
-
-
 
 
 def combined_shape(length, shape=None):
@@ -60,6 +56,24 @@ def discount_cumsum(x, discount):
     return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
 
+def rgb_to_grayscale(rgb_image):
+    """
+    将RGB图像转换为灰度图像
+    """
+    if len(rgb_image.shape) == 3:
+        # 单张图像 (H, W, 3)
+        r, g, b = rgb_image[:, :, 0], rgb_image[:, :, 1], rgb_image[:, :, 2]
+        gray = 0.299 * r + 0.587 * g + 0.114 * b
+        return gray
+    elif len(rgb_image.shape) == 4:
+        # 批量图像 (B, H, W, 3)
+        r, g, b = rgb_image[:, :, :, 0], rgb_image[:, :, :, 1], rgb_image[:, :, :, 2]
+        gray = 0.299 * r + 0.587 * g + 0.114 * b
+        return gray
+    else:
+        raise ValueError(f"不支持的图像形状: {rgb_image.shape}")
+
+
 class Actor(nn.Module):
 
     def _distribution(self, obs):
@@ -69,9 +83,6 @@ class Actor(nn.Module):
         raise NotImplementedError
 
     def forward(self, obs, act=None):
-        # Produce action distributions for given observations, and 
-        # optionally compute the log likelihood of given actions under
-        # those distributions.
         pi = self._distribution(obs)
         logp_a = None
         if act is not None:
@@ -273,6 +284,20 @@ class PPOBuffer:
         
         all_obs = all_obs.astype(np.float32)
         
+        # 确保观测数据是正确的维度格式
+        if len(all_obs.shape) == 2:
+            # 如果是 (N, H*W) 格式，需要reshape为 (N, H, W)
+            # 这里假设图像是96x96
+            if all_obs.shape[1] == 96 * 96:
+                all_obs = all_obs.reshape(-1, 96, 96)
+            elif all_obs.shape[1] == 96 * 96 * 3:
+                # 如果是彩色图像，转换为灰度
+                all_obs = all_obs.reshape(-1, 96, 96, 3)
+                all_obs = rgb_to_grayscale(all_obs)
+        elif len(all_obs.shape) == 4 and all_obs.shape[-1] == 3:
+            # 如果是彩色图像，转换为灰度
+            all_obs = rgb_to_grayscale(all_obs)
+        
         # 归一化优势函数
         adv_mean, adv_std = mpi_statistics_scalar(all_adv)
         all_adv = (all_adv - adv_mean) / adv_std
@@ -332,6 +357,10 @@ class PPOAgent:
                 torch.backends.cudnn.benchmark = True
                 torch.backends.cudnn.deterministic = False
                 print("⚡ 启用GPU优化: CUDNN benchmark")
+                
+                # 显存优化设置
+                torch.cuda.empty_cache()  # 清空显存缓存
+                print("🧹 清空GPU显存缓存")
             else:
                 self.device = torch.device('cpu')
                 print("💻 使用CPU训练")
@@ -342,6 +371,8 @@ class PPOAgent:
                 torch.backends.cudnn.benchmark = True
                 torch.backends.cudnn.deterministic = False
                 print("⚡ 启用GPU优化: CUDNN benchmark")
+                torch.cuda.empty_cache()  # 清空显存缓存
+                print("🧹 清空GPU显存缓存")
         
         # Initialize components
         self._setup_environment()
@@ -585,6 +616,10 @@ class PPOAgent:
         
         # 记录GPU训练时间
         self.epoch_metrics['gpu_times'].append(self.epoch_metrics['gpu_times'][-1] + gpu_train_time)
+        
+        # 显存优化：定期清理显存缓存
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         # Log changes from update
         kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
@@ -619,7 +654,8 @@ class PPOAgent:
         if self.device.type == 'cuda':
             gpu_memory = torch.cuda.memory_allocated() / 1024**2
             gpu_max_memory = torch.cuda.max_memory_allocated() / 1024**2
-            gpu_info = f" | GPU: {gpu_memory:.1f}/{gpu_max_memory:.1f}MB"
+            gpu_reserved = torch.cuda.memory_reserved() / 1024**2
+            gpu_info = f" | GPU: {gpu_memory:.1f}/{gpu_max_memory:.1f}MB (预留:{gpu_reserved:.1f}MB)"
         gpu_time = self.epoch_metrics['gpu_times'][-1] if self.epoch_metrics['gpu_times'] else 0.0
         cpu_time = self.epoch_metrics['cpu_times'][-1] if self.epoch_metrics['cpu_times'] else 0.0
         total_time = gpu_time + cpu_time
@@ -703,8 +739,15 @@ class PPOAgent:
                     torch.cuda.synchronize()  # 确保GPU操作完成
                 gpu_start = time.time()
                 
-                # Move observation to device
-                obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
+                # 处理图像观测：如果是彩色图像，转换为灰度
+                if len(o.shape) == 3 and o.shape[-1] == 3:
+                    # 彩色图像，转换为灰度
+                    o_gray = rgb_to_grayscale(o)
+                    obs_tensor = torch.as_tensor(o_gray, dtype=torch.float32).to(self.device)
+                else:
+                    # 已经是灰度图像或其他格式
+                    obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
+                
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} obs {o.shape}")
                 a, v, logp = self.ac.step(obs_tensor)
@@ -737,8 +780,14 @@ class PPOAgent:
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} ep_ret {ep_ret} ep_len {ep_len}")
 
-                # save and log
-                self.buf.store(o, a, r, v, logp)
+                # save and log - 存储灰度图像
+                if len(o.shape) == 3 and o.shape[-1] == 3:
+                    # 彩色图像，转换为灰度后存储
+                    o_gray = rgb_to_grayscale(o)
+                    self.buf.store(o_gray, a, r, v, logp)
+                else:
+                    # 已经是灰度图像或其他格式
+                    self.buf.store(o, a, r, v, logp)
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} store")
                 # 记录价值估计到 TensorBoard 指标中
@@ -761,7 +810,14 @@ class PPOAgent:
                         if self.device.type == 'cuda':
                             torch.cuda.synchronize()
                         gpu_start = time.time()
-                        obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
+                        # 处理图像观测：如果是彩色图像，转换为灰度
+                        if len(o.shape) == 3 and o.shape[-1] == 3:
+                            # 彩色图像，转换为灰度
+                            o_gray = rgb_to_grayscale(o)
+                            obs_tensor = torch.as_tensor(o_gray, dtype=torch.float32).to(self.device)
+                        else:
+                            # 已经是灰度图像或其他格式
+                            obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
                         _, v, _ = self.ac.step(obs_tensor)  # 获取引导价值V(s_T)
                         if epoch < num_debug_epochs and t < num_debug_steps:
                             print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} v {v}")

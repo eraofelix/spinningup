@@ -74,7 +74,7 @@ class CNNFeatureExtractor(nn.Module):
     可配置的CNN特征提取器，支持命令行参数控制
     专门为96x96x3的CarRacing图像设计
     """
-    def __init__(self, input_channels=3, feature_dim=256, cnn_channels=[16, 32, 64, 128], 
+    def __init__(self, input_channels=1, feature_dim=256, cnn_channels=[16, 32, 64, 128], 
                  attention_reduction=8, dropout_rate=0.1):
         super(CNNFeatureExtractor, self).__init__()
         
@@ -129,9 +129,27 @@ class CNNFeatureExtractor(nn.Module):
         self.feature_dim = feature_dim
         
     def forward(self, x):
-        # x: (B, C, H, W) 或 (B, H, W, C)
-        if len(x.shape) == 4 and x.shape[-1] == 3:
-            # 如果是 (B, H, W, C) 格式，转换为 (B, C, H, W)
+        # x: (B, C, H, W) 或 (B, H, W, C) 或 (B, H, W) 或 (H, W) 对于灰度图像
+        if len(x.shape) == 2:
+            # 如果是 (H, W) 格式的灰度图像，添加batch和通道维度
+            x = x.unsqueeze(0).unsqueeze(0)  # (H, W) -> (1, 1, H, W)
+        elif len(x.shape) == 3:
+            # 如果是 (B, H, W) 格式的灰度图像，添加通道维度
+            x = x.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
+        elif len(x.shape) == 4 and x.shape[-1] == 1:
+            # 如果是 (B, H, W, 1) 格式，转换为 (B, 1, H, W)
+            x = x.permute(0, 3, 1, 2)
+        elif len(x.shape) == 4 and x.shape[1] == 1:
+            # 已经是 (B, 1, H, W) 格式，无需转换
+            pass
+        elif len(x.shape) == 4 and x.shape[-1] == 3:
+            # 如果是 (B, H, W, 3) 格式的彩色图像，转换为 (B, 3, H, W)
+            x = x.permute(0, 3, 1, 2)
+        elif len(x.shape) == 4 and x.shape[1] == 3:
+            # 已经是 (B, 3, H, W) 格式，无需转换
+            pass
+        else:
+            # 其他情况，假设是 (B, H, W, C) 格式，转换为 (B, C, H, W)
             x = x.permute(0, 3, 1, 2)
         
         # 确保输入是float类型
@@ -167,7 +185,7 @@ class CNNActor(nn.Module):
         
         # CNN特征提取器
         self.cnn_extractor = CNNFeatureExtractor(
-            input_channels=3, 
+            input_channels=1, 
             feature_dim=feature_dim,
             cnn_channels=cnn_channels,
             attention_reduction=attention_reduction,
@@ -253,7 +271,7 @@ class CNNCritic(nn.Module):
         
         # CNN特征提取器
         self.cnn_extractor = CNNFeatureExtractor(
-            input_channels=3,
+            input_channels=1,
             feature_dim=feature_dim,
             cnn_channels=cnn_channels,
             attention_reduction=attention_reduction,
@@ -297,7 +315,7 @@ class CNNActorCritic(nn.Module):
         
         # 创建共享的CNN特征提取器
         self.cnn_extractor = CNNFeatureExtractor(
-            input_channels=3,
+            input_channels=1,
             feature_dim=feature_dim,
             cnn_channels=cnn_channels,
             attention_reduction=attention_reduction,
