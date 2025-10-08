@@ -1041,13 +1041,8 @@ class PPOAgent:
         # CNN networks expect image format (B, C, H, W) or (B, H, W, C)
         # No flattening needed for CNN-based networks
 
-        # Policy loss - 适配CNNActorCriticShared接口
-        if hasattr(self.ac, 'pi_and_logp'):
-            # 使用新的CNNActorCriticShared接口
-            pi, logp = self.ac.pi_and_logp(obs, act, assume_env_action=True)
-        else:
-            # 兼容旧的接口
-            pi, logp = self.ac.pi(obs, act)
+        # Policy loss - 使用CNNActorCriticShared接口
+        pi, logp = self.ac.pi_and_logp(obs, act, assume_env_action=True)
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-self.clip_ratio, 1+self.clip_ratio) * adv
         loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
@@ -1072,14 +1067,8 @@ class PPOAgent:
         obs = obs.to(self.device)
         ret = ret.to(self.device)
 
-        # 适配CNNActorCriticShared接口
-        if hasattr(self.ac, 'value'):
-            # 使用新的CNNActorCriticShared接口
-            v = self.ac.value(obs)
-        else:
-            # 兼容旧的接口
-            v = self.ac.v(obs)
-        
+        # 使用CNNActorCriticShared接口
+        v = self.ac.value(obs)
         return ((v - ret)**2).mean()
 
     def _save_model(self, epoch):
@@ -1374,16 +1363,10 @@ if __name__ == '__main__':
     parser.add_argument('--target_kl', type=float, default=0.01, help='KL散度目标值（更保守）')
     parser.add_argument('--device', type=str, default=None, help='指定设备 (cuda/cpu/auto)')
     
-    # CNN网络参数控制
+    # 网络参数控制
     parser.add_argument('--feature_dim', type=int, default=256, help='CNN特征维度')
-    parser.add_argument('--cnn_channels', type=int, nargs=4, default=[16, 32, 64, 128], 
-                       help='CNN各层通道数 [conv1, conv2, conv3, conv4]')
     parser.add_argument('--hidden_sizes', type=int, nargs='+', default=[128, 64], 
                        help='全连接层隐藏层大小')
-    parser.add_argument('--attention_reduction', type=int, default=8, 
-                       help='注意力机制reduction参数')
-    parser.add_argument('--dropout_rate', type=float, default=0.1, 
-                       help='Dropout比率')
     parser.add_argument('--min_steps_per_proc', type=int, default=None,
                        help='每个进程的最小步数，用于避免轨迹截断')
     args = parser.parse_args()
@@ -1410,10 +1393,7 @@ if __name__ == '__main__':
             feature_dim=args.feature_dim,
             actor_hidden=args.hidden_sizes,
             critic_hidden=args.hidden_sizes,
-            car_racing_mode=True,
-            # cnn_channels=args.cnn_channels,
-            # attention_reduction=args.attention_reduction,
-            # dropout_rate=args.dropout_rate
+            car_racing_mode=True
         )
     else:
         # 向量观测，使用MLP
