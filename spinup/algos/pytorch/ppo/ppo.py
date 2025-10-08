@@ -134,8 +134,8 @@ class SimpleSharedCNN(nn.Module):
         # ensure float32 in [0,1]
         if x.dtype != torch.float32:
             x = x.float()
-        if x.max() > 1.0:
-            x = x / 255.0
+        # if x.max() > 1.0:
+        x = x / 255.0
         feats = self.conv(x)
         feats = self.head(feats)
         return feats  # (B, feature_dim)
@@ -144,7 +144,7 @@ class ActorHead(nn.Module):
     """
     Gaussian policy head with Tanh squashing to [-1,1].
     """
-    def __init__(self, feature_dim, act_dim, hidden_sizes=(256,128), init_log_std=-0.5):
+    def __init__(self, feature_dim, act_dim, hidden_sizes=(256,128), init_log_std=-1.5):
         super().__init__()
         mlp = []
         in_dim = feature_dim
@@ -158,7 +158,7 @@ class ActorHead(nn.Module):
     def forward(self, feats):
         h = self.mlp(feats)
         mu = self.mu_layer(h)
-        log_std = self.log_std.clamp(-5.0, 2.0)
+        log_std = self.log_std.clamp(-4.0, 1.0)
         return mu, log_std
 
 class CriticHead(nn.Module):
@@ -332,11 +332,20 @@ class CNNActorCriticShared(nn.Module):
             obs = obs.unsqueeze(0)
         feats = self.encoder(obs)
         return self.v(feats)
+    
+    def _pi_dist_from_params(self, mu, log_std):
+        """从参数创建策略分布"""
+        if self.is_box:
+            return TanhNormal(mu, log_std)
+        else:
+            from torch.distributions import Categorical
+            return Categorical(logits=mu)
 
 class PPOBuffer:
-    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
+    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95, adv_clip_range=10.0):
         self.gamma, self.lam = gamma, lam
         self.max_size = size
+        self.adv_clip_range = adv_clip_range  # 优势函数裁剪范围
         
         # 存储观测维度信息
         self.obs_dim = obs_dim
@@ -421,6 +430,7 @@ class PPOBuffer:
         # 将计算结果添加到轨迹中
         self.current_traj['adv'] = adv
         self.current_traj['ret'] = ret
+        self.current_traj['deltas'] = deltas  # 存储delta用于统计
         
         # 保存完整轨迹
         self.trajectories.append(self.current_traj)
@@ -441,12 +451,23 @@ class PPOBuffer:
         all_ret = np.concatenate([t['ret'] for t in self.trajectories])
         all_adv = np.concatenate([t['adv'] for t in self.trajectories])
         all_logp = np.concatenate([t['logp'] for t in self.trajectories])
+        all_deltas = np.concatenate([t['deltas'] for t in self.trajectories])
         
         all_obs = all_obs.astype(np.float32)
+        
+        # 统计GAE数值（规范化前）
+        self._print_gae_statistics(all_adv, all_ret, all_deltas)
+        
+        # 对优势函数进行轻裁剪（winsorize），抑制长尾样本
+        all_adv = np.clip(all_adv, -self.adv_clip_range, self.adv_clip_range)
+        print(f"  优势函数裁剪后: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
         
         # 归一化优势函数
         adv_mean, adv_std = mpi_statistics_scalar(all_adv)
         all_adv = (all_adv - adv_mean) / adv_std
+        
+        # 验证规范化后的优势函数
+        self._print_normalized_adv_statistics(all_adv)
         
         # 清空轨迹和重置计数器
         self.trajectories = []
@@ -460,6 +481,62 @@ class PPOBuffer:
             'adv': torch.as_tensor(all_adv, dtype=torch.float32),
             'logp': torch.as_tensor(all_logp, dtype=torch.float32)
         }
+    
+    def _print_gae_statistics(self, adv, ret, deltas):
+        """打印GAE统计信息"""
+        print(f"\n📊 GAE统计信息:")
+        print(f"  优势函数 (裁剪前):")
+        print(f"    均值: {adv.mean():.6f}")
+        print(f"    标准差: {adv.std():.6f}")
+        print(f"    最小值: {adv.min():.6f}")
+        print(f"    最大值: {adv.max():.6f}")
+        
+        # 检查是否有极端值
+        extreme_positive = np.sum(adv > self.adv_clip_range)
+        extreme_negative = np.sum(adv < -self.adv_clip_range)
+        if extreme_positive > 0 or extreme_negative > 0:
+            print(f"    极端值: {extreme_positive} 个 > {self.adv_clip_range}, {extreme_negative} 个 < -{self.adv_clip_range}")
+            print(f"    💡 将进行裁剪以抑制长尾样本影响")
+        
+        print(f"  回报统计:")
+        print(f"    均值: {ret.mean():.6f}")
+        print(f"    标准差: {ret.std():.6f}")
+        print(f"    最小值: {ret.min():.6f}")
+        print(f"    最大值: {ret.max():.6f}")
+        print(f"    百分位数 - P5: {np.percentile(ret, 5):.6f}, P50: {np.percentile(ret, 50):.6f}, P95: {np.percentile(ret, 95):.6f}")
+        
+        print(f"  Delta统计 (δ = r + γV(s') - V(s)):")
+        print(f"    均值: {deltas.mean():.6f}")
+        print(f"    标准差: {deltas.std():.6f}")
+        print(f"    最小值: {deltas.min():.6f}")
+        print(f"    最大值: {deltas.max():.6f}")
+        print(f"    百分位数 - P5: {np.percentile(deltas, 5):.6f}, P50: {np.percentile(deltas, 50):.6f}, P95: {np.percentile(deltas, 95):.6f}")
+        
+        # 检查问题
+        if abs(adv.mean()) < 1e-6 and adv.std() < 1e-6:
+            print(f"  ⚠️  优势函数几乎为0，PPO梯度信号很弱！")
+        if ret.std() < 1e-6:
+            print(f"  ⚠️  回报几乎恒定，环境可能有问题！")
+        if ret.mean() < -100:
+            print(f"  ⚠️  回报过低，可能需要调整奖励设计！")
+        if abs(deltas.mean()) < 1e-6 and deltas.std() < 1e-6:
+            print(f"  ⚠️  Delta几乎为0，价值函数可能没有学习！")
+        if deltas.std() > 100:
+            print(f"  ⚠️  Delta标准差过大，可能存在梯度爆炸！")
+    
+    def _print_normalized_adv_statistics(self, adv_normalized):
+        """打印规范化后的优势函数统计"""
+        print(f"  优势函数 (规范化后):")
+        print(f"    均值: {adv_normalized.mean():.6f} (应接近0)")
+        print(f"    标准差: {adv_normalized.std():.6f} (应接近1)")
+        print(f"    最小值: {adv_normalized.min():.6f}")
+        print(f"    最大值: {adv_normalized.max():.6f}")
+        
+        # 验证规范化效果
+        if abs(adv_normalized.mean()) > 0.1:
+            print(f"  ⚠️  规范化后均值偏离0太多: {adv_normalized.mean():.6f}")
+        if abs(adv_normalized.std() - 1.0) > 0.1:
+            print(f"  ⚠️  规范化后标准差偏离1太多: {adv_normalized.std():.6f}")
 
 class PPOAgent:
     def __init__(self, env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
@@ -623,14 +700,16 @@ class PPOAgent:
         num_procs_val = num_procs()
 
         self.local_steps_per_epoch = self.steps_per_epoch
-        self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam)
+        self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam, adv_clip_range=5.0)
 
         # Set up optimizers for policy and value function
+        # 策略优化器只优化pi头，避免重复优化encoder
         self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.pi_lr)
-        self.vf_optimizer = Adam(self.ac.v.parameters(), lr=self.vf_lr)
+        # 价值优化器优化encoder+v，确保encoder参数参与value优化
+        self.vf_optimizer = Adam(list(self.ac.encoder.parameters()) + list(self.ac.v.parameters()), lr=self.vf_lr)
 
     def _compute_loss_pi(self, data):
-        """Compute PPO policy loss"""
+        """Compute PPO policy loss - 只优化pi头，不涉及encoder"""
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
         
         # Move data to device
@@ -639,12 +718,16 @@ class PPOAgent:
         adv = adv.to(self.device)
         logp_old = logp_old.to(self.device)
 
-        # Handle image observations: keep as images for CNN
-        # CNN networks expect image format (B, C, H, W) or (B, H, W, C)
-        # No flattening needed for CNN-based networks
-
-        # Policy loss - 使用CNNActorCriticShared接口，统一使用tanh空间
-        pi, logp = self.ac.pi_and_logp(obs, act, assume_env_action=False)
+        # 策略损失 - 只使用pi头，避免重复优化encoder
+        # 先获取特征（不计算梯度，因为encoder由value优化器负责）
+        with torch.no_grad():
+            feats = self.ac.encoder(obs)
+        
+        # 只计算pi头的损失
+        mu, log_std = self.ac.pi(feats)
+        pi = self.ac._pi_dist_from_params(mu, log_std)
+        logp = pi.log_prob(act)
+        
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-self.clip_ratio, 1+self.clip_ratio) * adv
         loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
@@ -659,7 +742,7 @@ class PPOAgent:
         return loss_pi, pi_info
 
     def _compute_loss_v(self, data):
-        """Compute value function loss
+        """Compute value function loss - 优化encoder和value头
         让价值函数逼近目标价值，目标价值是通过GAE (Generalized Advantage Estimation) 计算的：
         self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[:-1]
         """
@@ -669,8 +752,9 @@ class PPOAgent:
         obs = obs.to(self.device)
         ret = ret.to(self.device)
 
-        # 使用CNNActorCriticShared接口
-        v = self.ac.value(obs)
+        # 价值损失 - 优化encoder和value头
+        feats = self.ac.encoder(obs)  # encoder参与梯度计算
+        v = self.ac.v(feats)
         return ((v - ret)**2).mean()
 
     def _save_model(self, epoch):
@@ -699,7 +783,7 @@ class PPOAgent:
             if kl > 1.5 * self.target_kl:
                 break
             loss_pi.backward()
-            mpi_avg_grads(self.ac.pi)    # average grads across MPI processes
+            mpi_avg_grads(self.ac.pi)    # average grads across MPI processes (只对pi头)
             self.pi_optimizer.step()
 
         # Value function learning
@@ -707,7 +791,9 @@ class PPOAgent:
             self.vf_optimizer.zero_grad()
             loss_v = self._compute_loss_v(data)
             loss_v.backward()
-            mpi_avg_grads(self.ac.v)    # average grads across MPI processes
+            # 对encoder和value头进行梯度平均
+            mpi_avg_grads(self.ac.encoder)    # average encoder grads across MPI processes
+            mpi_avg_grads(self.ac.v)          # average value head grads across MPI processes
             self.vf_optimizer.step()
 
         if self.device.type == 'cuda':
@@ -930,6 +1016,7 @@ class PPOAgent:
                     if epoch < num_debug_epochs and t < num_debug_steps:
                         print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} reset")
                     ep_ret, ep_len = 0, 0
+            
             if epoch < num_debug_epochs:
                 print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} end")
             # 记录时间统计
@@ -958,7 +1045,7 @@ class PPOAgent:
         self.tb_writer.close()
 
 def ppo(env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
+        steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.1, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=100,
         target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
