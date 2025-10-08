@@ -23,6 +23,33 @@ DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__fi
 FORCE_DATESTAMP = False
 
 
+def count_vars(module):
+    return sum([np.prod(p.shape) for p in module.parameters()])
+
+
+def discount_cumsum(x, discount):
+    """
+    magic from rllab for computing discounted cumulative sums of vectors.
+
+    input: 
+        vector x, 
+        [x0, 
+         x1, 
+         x2]
+
+    output:
+        [x0 + discount * x1 + discount^2 * x2,  
+         x1 + discount * x2,
+         x2]
+    """
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+
+
+# ============================================================================
+# CNN
+# ============================================================================
+
+
 class SpatialAttention(nn.Module):
     """
     空间注意力机制，用于CNN特征图
@@ -352,34 +379,303 @@ class CNNActorCritic(nn.Module):
         return self.step(obs)[0]
 
 
-def mlp(sizes, activation, output_activation=nn.Identity):
-    layers = []
-    for j in range(len(sizes)-1):
-        act = activation if j < len(sizes)-2 else output_activation
-        layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
-    return nn.Sequential(*layers)
+# ============================================================================
+# SimpleSharedCNN
+# ============================================================================
 
+def atanh(x, eps=1e-6):
+    x = x.clamp(-1 + eps, 1 - eps)
+    return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
-def count_vars(module):
-    return sum([np.prod(p.shape) for p in module.parameters()])
-
-
-def discount_cumsum(x, discount):
+class TanhNormal:
     """
-    magic from rllab for computing discounted cumulative sums of vectors.
-
-    input: 
-        vector x, 
-        [x0, 
-         x1, 
-         x2]
-
-    output:
-        [x0 + discount * x1 + discount^2 * x2,  
-         x1 + discount * x2,
-         x2]
+    Tanh-squashed Gaussian with correct log_prob (includes tanh Jacobian).
+    pi(z) = N(mu, std); a = tanh(z)
+    log_prob(a) = log N(z | mu, std) - sum log(1 - tanh(z)^2)
+                where z = atanh(a)
+    Supports sampling by reparameterization.
     """
-    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+    def __init__(self, mu, log_std, eps=1e-6):
+        self.mu = mu
+        self.log_std = log_std
+        self.std = torch.exp(log_std)
+        self.base_dist = Normal(mu, self.std)
+        self.eps = eps
+
+    def sample(self):
+        z = self.base_dist.rsample()
+        a = torch.tanh(z)
+        return a
+
+    def rsample_with_pre_tanh(self):
+        z = self.base_dist.rsample()
+        a = torch.tanh(z)
+        return a, z
+
+    def log_prob(self, a):
+        # Inverse transform
+        z = atanh(a, self.eps)
+        log_prob_gauss = self.base_dist.log_prob(z)  # shape: (..., act_dim)
+        # log |det J| for tanh: sum log(1 - tanh(z)^2) = sum log(1 - a^2)
+        log_det = torch.log(1 - a.pow(2) + self.eps)
+        return (log_prob_gauss - log_det).sum(dim=-1)
+
+    def entropy(self, num_samples=1):
+        # Entropy of squashed distribution has no simple closed form.
+        # A common workaround is Monte Carlo approximation.
+        with torch.no_grad():
+            ent = 0.0
+            for _ in range(num_samples):
+                z = self.base_dist.sample()
+                a = torch.tanh(z)
+                # H = -E[log_prob(a)]
+                ent += (-self.log_prob(a)).mean()
+            ent /= num_samples
+        return ent
+
+class SimpleSharedCNN(nn.Module):
+    """
+    Lightweight CNN for 96x96x3 inputs. No BN/Dropout/Attention.
+    Outputs a feature vector of size feature_dim.
+    """
+    def __init__(self, in_channels=3, feature_dim=256):
+        super().__init__()
+        # Downscale 96 -> 48 -> 24 -> 12 -> 6
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4, padding=2),  # 96->24? Actually: (96+2*2-8)/4+1 = 24+1? Let's trust typical.
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),  # 24->12
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # 12->6
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1), # keep 6x6
+            nn.ReLU(inplace=True),
+        )
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(128, feature_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.feature_dim = feature_dim
+
+    def forward(self, x):
+        # x: (B, C=3, H=96, W=96) or (C=3, H, W) or (B, H, W, C) or (H, W, C)
+        if x.dim() == 3:
+            # 判断是 (C, H, W) 还是 (H, W, C)
+            if x.shape[0] == 3:  # (C, H, W)
+                x = x.unsqueeze(0)  # (1, C, H, W)
+            else:  # (H, W, C)
+                x = x.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+        elif x.dim() == 4:
+            # 判断是 (B, C, H, W) 还是 (B, H, W, C)
+            if x.shape[1] == 3:  # (B, C, H, W)
+                pass  # 已经是正确格式
+            else:  # (B, H, W, C)
+                x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
+        
+        # ensure float32 in [0,1]
+        if x.dtype != torch.float32:
+            x = x.float()
+        if x.max() > 1.0:
+            x = x / 255.0
+        feats = self.conv(x)
+        feats = self.head(feats)
+        return feats  # (B, feature_dim)
+
+class ActorHead(nn.Module):
+    """
+    Gaussian policy head with Tanh squashing to [-1,1].
+    """
+    def __init__(self, feature_dim, act_dim, hidden_sizes=(256,128), init_log_std=-0.5):
+        super().__init__()
+        mlp = []
+        in_dim = feature_dim
+        for h in hidden_sizes:
+            mlp += [nn.Linear(in_dim, h), nn.ReLU(inplace=True)]
+            in_dim = h
+        self.mlp = nn.Sequential(*mlp)
+        self.mu_layer = nn.Linear(in_dim, act_dim)
+        self.log_std = nn.Parameter(torch.ones(act_dim) * init_log_std)
+
+    def forward(self, feats):
+        h = self.mlp(feats)
+        mu = self.mu_layer(h)
+        log_std = self.log_std.clamp(-5.0, 2.0)
+        return mu, log_std
+
+class CriticHead(nn.Module):
+    def __init__(self, feature_dim, hidden_sizes=(256,128)):
+        super().__init__()
+        mlp = []
+        in_dim = feature_dim
+        for h in hidden_sizes:
+            mlp += [nn.Linear(in_dim, h), nn.ReLU(inplace=True)]
+            in_dim = h
+        mlp += [nn.Linear(in_dim, 1)]
+        self.v = nn.Sequential(*mlp)
+
+    def forward(self, feats):
+        return self.v(feats).squeeze(-1)
+
+class CNNActorCriticShared(nn.Module):
+    """
+    Shared CNN + separate heads. Supports:
+    - Continuous Box actions with Tanh-squashed Gaussian
+    - Discrete actions (optional path if needed)
+    """
+    def __init__(self, observation_space, action_space,
+                 feature_dim=256, actor_hidden=(256,128), critic_hidden=(256,128),
+                 car_racing_mode=True):
+        super().__init__()
+        self.obs_space = observation_space
+        self.act_space = action_space
+        self.is_box = isinstance(action_space, Box)
+        self.is_discrete = isinstance(action_space, Discrete)
+        assert self.is_box or self.is_discrete, "Unsupported action space"
+
+        # Shared CNN
+        in_channels = 3  # RGB
+        self.encoder = SimpleSharedCNN(in_channels=in_channels, feature_dim=feature_dim)
+
+        if self.is_box:
+            act_dim = action_space.shape[0]
+            self.pi = ActorHead(feature_dim, act_dim, hidden_sizes=actor_hidden)
+            self.v = CriticHead(feature_dim, hidden_sizes=critic_hidden)
+        else:
+            act_dim = action_space.n
+            self.policy_logits = nn.Sequential(
+                nn.Linear(feature_dim, actor_hidden[0]), nn.ReLU(inplace=True),
+                nn.Linear(actor_hidden[0], act_dim)
+            )
+            self.v = CriticHead(feature_dim, hidden_sizes=critic_hidden)
+
+        # CarRacing 专用动作映射开关
+        self.car_racing_mode = car_racing_mode and self.is_box and action_space.shape[0] == 3
+
+    # ---------- Policy distribution ----------
+
+    def _pi_dist(self, obs):
+        feats = self.encoder(obs)
+        if self.is_box:
+            mu, log_std = self.pi(feats)
+            return TanhNormal(mu, log_std), feats
+        else:
+            logits = self.policy_logits(feats)
+            from torch.distributions import Categorical
+            return Categorical(logits=logits), feats
+
+    def _log_prob_from_dist(self, pi, act):
+        if self.is_box:
+            # act expected in [-1,1] (tanh range)
+            return pi.log_prob(act)
+        else:
+            return pi.log_prob(act)
+
+    # ---------- CarRacing action mapping ----------
+
+    @staticmethod
+    def _map_to_carracing(a_tanh):
+        """
+        Input a_tanh in [-1,1]^3.
+        Output:
+          steer in [-1,1]
+          gas   in [0,1]
+          brake in [0,1]
+        """
+        steer = a_tanh[..., 0]
+        gas   = (a_tanh[..., 1] + 1) * 0.5  # [-1,1] -> [0,1]
+        brake = (a_tanh[..., 2] + 1) * 0.5  # [-1,1] -> [0,1]
+        return torch.stack([steer, gas, brake], dim=-1)
+
+    @staticmethod
+    def _log_prob_carracing_from_tanh(pi, a_env):
+        """
+        If you want exact log_prob for env action space (after affine mapping),
+        you can transform back:
+          a_tanh[:,1:3] = 2*gas/brake - 1
+        Then add log|det J| of affine (constant): for each dim in [1,2],
+          scale s=2.0 -> log|s|=log 2. Sum across dims. This is constant wrt params.
+        In practice, PPO with constant offset in log_prob is okay to ignore for ratio,
+        but for completeness we include it.
+        """
+        eps = 1e-6
+        steer = a_env[..., 0].clamp(-1.0, 1.0)
+        gas   = a_env[..., 1].clamp(0.0, 1.0)
+        brake = a_env[..., 2].clamp(0.0, 1.0)
+        a_tanh = torch.stack([steer, gas*2-1, brake*2-1], dim=-1).clamp(-1+eps, 1-eps)
+        base_logp = pi.log_prob(a_tanh)  # includes tanh Jacobian
+        # affine mapping for gas/brake: a_env = (a_tanh+1)/2 -> da_env/da_tanh = 1/2
+        # log|det J_affine| = sum log(1/2) over dims 1 and 2 = 2 * log(1/2) = -2*log 2
+        # For log_prob of a_env, need to add log|det d a_tanh / d a_env| = -log|det J_affine|
+        # Here we want p(a_env) = p(a_tanh) * |det(d a_tanh / d a_env)|
+        # det(d a_tanh / d a_env) = 2 * 2 = 4 -> log 4
+        log_det = torch.log(torch.tensor(4.0, device=a_env.device))
+        return base_logp + log_det
+
+    # ---------- Public API ----------
+
+    def step(self, obs, return_env_action=True):
+        """
+        obs: (B,3,H,W) or (3,H,W). Returns:
+          - action np.array
+          - value np.array
+          - logp np.array (for the exact action fed back into policy gradient)
+        If return_env_action=True and car_racing_mode, returns mapped env action.
+        """
+        with torch.no_grad():
+            if obs.dim() == 3:
+                obs = obs.unsqueeze(0)
+            pi, feats = self._pi_dist(obs)
+            if self.is_box:
+                a_tanh = pi.sample()  # in [-1,1]
+                v = self.v(feats)
+                if self.car_racing_mode and return_env_action:
+                    a_env = self._map_to_carracing(a_tanh)
+                    # 用 a_tanh 的 log_prob 做 PPO（ratio 不变），也可以用精确 env log_prob：
+                    # logp = self._log_prob_carracing_from_tanh(pi, a_env)
+                    logp = pi.log_prob(a_tanh)
+                    return a_env.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
+                else:
+                    logp = pi.log_prob(a_tanh)
+                    return a_tanh.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
+            else:
+                a = pi.sample()
+                v = self.v(feats)
+                logp = pi.log_prob(a)
+                return a.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
+
+    def act(self, obs, return_env_action=True):
+        return self.step(obs, return_env_action=return_env_action)[0]
+
+    # ---------- Training-time forward ----------
+
+    def pi_and_logp(self, obs, act, assume_env_action=True):
+        """
+        obs: tensor (B,3,H,W)
+        act: tensor (B, act_dim)
+        assume_env_action:
+          - True: act 是 CarRacing 的 env 动作（[-1,1], [0,1], [0,1]），将其映射回 tanh 空间计算 logp
+          - False: act 已经是 tanh 空间 [-1,1]，直接用
+        Returns: pi_dist, logp
+        """
+        pi, _ = self._pi_dist(obs)
+        if self.is_box:
+            if self.car_racing_mode and assume_env_action:
+                logp = self._log_prob_carracing_from_tanh(pi, act)
+            else:
+                logp = pi.log_prob(act)
+            return pi, logp
+        else:
+            from torch.distributions import Categorical
+            logp = pi.log_prob(act)
+            return pi, logp
+
+    def value(self, obs):
+        if obs.dim() == 3:
+            obs = obs.unsqueeze(0)
+        feats = self.encoder(obs)
+        return self.v(feats)
 
 
 # ============================================================================
@@ -530,7 +826,7 @@ class PPOAgent:
     with early stopping based on approximate KL
     """
     
-    def __init__(self, env_fn, actor_critic=CNNActorCritic, ac_kwargs=dict(), seed=0, 
+    def __init__(self, env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
                  target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
@@ -745,8 +1041,13 @@ class PPOAgent:
         # CNN networks expect image format (B, C, H, W) or (B, H, W, C)
         # No flattening needed for CNN-based networks
 
-        # Policy loss
-        pi, logp = self.ac.pi(obs, act)
+        # Policy loss - 适配CNNActorCriticShared接口
+        if hasattr(self.ac, 'pi_and_logp'):
+            # 使用新的CNNActorCriticShared接口
+            pi, logp = self.ac.pi_and_logp(obs, act, assume_env_action=True)
+        else:
+            # 兼容旧的接口
+            pi, logp = self.ac.pi(obs, act)
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-self.clip_ratio, 1+self.clip_ratio) * adv
         loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
@@ -771,7 +1072,15 @@ class PPOAgent:
         obs = obs.to(self.device)
         ret = ret.to(self.device)
 
-        return ((self.ac.v(obs) - ret)**2).mean()
+        # 适配CNNActorCriticShared接口
+        if hasattr(self.ac, 'value'):
+            # 使用新的CNNActorCriticShared接口
+            v = self.ac.value(obs)
+        else:
+            # 兼容旧的接口
+            v = self.ac.v(obs)
+        
+        return ((v - ret)**2).mean()
 
     def _save_model(self, epoch):
         """Save model at specified epoch"""
@@ -1036,7 +1345,7 @@ class PPOAgent:
         self.tb_writer.close()
 
 
-def ppo(env_fn, actor_critic=CNNActorCritic, ac_kwargs=dict(), seed=0, 
+def ppo(env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
         target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
@@ -1096,13 +1405,15 @@ if __name__ == '__main__':
     if len(env_test.observation_space.shape) == 3:
         # 图像观测，使用CNN
         print("🖼️  检测到图像观测，使用CNN网络")
-        actor_critic = CNNActorCritic
+        actor_critic = CNNActorCriticShared
         ac_kwargs = dict(
             feature_dim=args.feature_dim,
-            hidden_sizes=args.hidden_sizes,
-            cnn_channels=args.cnn_channels,
-            attention_reduction=args.attention_reduction,
-            dropout_rate=args.dropout_rate
+            actor_hidden=args.hidden_sizes,
+            critic_hidden=args.hidden_sizes,
+            car_racing_mode=True,
+            # cnn_channels=args.cnn_channels,
+            # attention_reduction=args.attention_reduction,
+            # dropout_rate=args.dropout_rate
         )
     else:
         # 向量观测，使用MLP
