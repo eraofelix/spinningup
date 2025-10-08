@@ -395,7 +395,7 @@ class CNNActorCriticShared(nn.Module):
             return Categorical(logits=mu)
 
 class PPOBuffer:
-    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95, adv_clip_range=10.0):
+    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.9, adv_clip_range=3.0):
         self.gamma, self.lam = gamma, lam
         self.max_size = size
         self.adv_clip_range = adv_clip_range  # 优势函数裁剪范围
@@ -519,6 +519,15 @@ class PPOBuffer:
         # 归一化优势函数
         adv_mean, adv_std = mpi_statistics_scalar(all_adv)
         all_adv = (all_adv - adv_mean) / adv_std
+        
+        # 如果标准差仍然太小，应用增强系数
+        if adv_std < 0.95:
+            boost_factor = 1.2
+            all_adv = all_adv * boost_factor
+            from spinup.utils.mpi_tools import proc_id
+            if proc_id() == 0:
+                print(f"  优势函数增强: std={adv_std:.3f} < 0.95, 应用增强系数 {boost_factor}")
+                print(f"  增强后优势函数: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
         
         # 验证规范化后的优势函数
         self._print_normalized_adv_statistics(all_adv)
@@ -768,7 +777,7 @@ class PPOAgent:
         num_procs_val = num_procs()
 
         self.local_steps_per_epoch = self.steps_per_epoch
-        self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam, adv_clip_range=5.0)
+        self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam, adv_clip_range=3.0)
 
         # Set up optimizers for policy and value function
         # 策略优化器优化encoder+pi，确保encoder参与策略学习
@@ -1028,8 +1037,8 @@ class PPOAgent:
 
         # Main loop: collect experience in env and update/log each epoch
         num_debug_epochs = 3
-        num_debug_steps = 10
-        reward_scale = getattr(self, 'reward_scale', 5.0)
+        num_debug_steps = 3
+        reward_scale = getattr(self, 'reward_scale', 3.0)
         for epoch in range(self.epochs):
             if epoch < num_debug_epochs:
                 print(f"Epoch {epoch} start")
