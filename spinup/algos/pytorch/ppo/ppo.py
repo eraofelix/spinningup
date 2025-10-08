@@ -79,35 +79,29 @@ class TanhNormal:
         return (log_prob_gauss - log_det).sum(dim=-1)
 
     def entropy(self, num_samples=1):
-        # Entropy of squashed distribution has no simple closed form.
-        # A common workaround is Monte Carlo approximation.
-        with torch.no_grad():
-            ent = 0.0
-            for _ in range(num_samples):
-                z = self.base_dist.sample()
-                a = torch.tanh(z)
-                # H = -E[log_prob(a)]
-                ent += (-self.log_prob(a)).mean()
-            ent /= num_samples
-        return ent
+        # 使用未squash的Normal熵作为代理，保持与log_prob计算的一致性
+        # H = 0.5 * Σ(1 + log(2πσ²)) = 0.5 * Σ(1 + log(2π) + 2*log(σ))
+        # 简化为: H = 0.5 * Σ(1 + log(2π) + 2*log_std)
+        log_2pi = np.log(2 * np.pi)
+        entropy = 0.5 * (1 + log_2pi + 2 * self.log_std).sum(dim=-1)
+        return entropy
 
 class SimpleSharedCNN(nn.Module):
     """
-    Lightweight CNN for 96x96 inputs with configurable channels. No BN/Dropout/Attention.
+    Lightweight CNN for 96x96 inputs with configurable channels. No BN/Dropout.
     Outputs a feature vector of size feature_dim.
     Supports FrameStack: RGB(3) -> RGB+Stack(12) or Grayscale(1) -> Grayscale+Stack(4)
     """
     def __init__(self, in_channels=3, feature_dim=256):
         super().__init__()
-        # Downscale 96 -> 48 -> 24 -> 12 -> 6
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4, padding=2),  # 96->24? Actually: (96+2*2-8)/4+1 = 24+1? Let's trust typical.
+            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4, padding=2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),  # 24->12
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # 12->6
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1), # keep 6x6
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
         )
         self.head = nn.Sequential(
@@ -119,50 +113,65 @@ class SimpleSharedCNN(nn.Module):
         self.feature_dim = feature_dim
 
     def forward(self, x):
-        # x: (B, C, H, W) or (C, H, W) or (B, H, W, C) or (H, W, C) or (stack_size, H, W, C) or (B, stack_size, H, W, C)
-        if x.dim() == 3:
-            # 判断是 (C, H, W) 还是 (H, W, C)
-            if x.shape[0] == 3:  # (C, H, W)
-                x = x.unsqueeze(0)  # (1, C, H, W)
-            else:  # (H, W, C)
-                x = x.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+        """
+        确定性重排到 (B, C, H, W) 并无条件归一化到 [0,1]
+        允许以下输入形状：
+          - (B, S, H, W, C)   # batched FrameStack Gymnasium
+          - (S, H, W, C)      # single FrameStack
+          - (B, H, W, C)      # batched NHWC
+          - (B, C, H, W)      # batched NCHW
+          - (C, H, W)         # single NCHW
+          - (H, W, C)         # single NHWC
+        """
+        orig_shape = x.shape
+        if x.dim() == 5:
+            # (B, S, H, W, C) -> (B, S*C, H, W)
+            B, S, H, W, C = x.shape
+            x = x.permute(0, 1, 4, 2, 3).reshape(B, S * C, H, W)
         elif x.dim() == 4:
-            # 判断是 (B, C, H, W) 还是 (B, H, W, C) 还是 (stack_size, H, W, C)
-            if x.shape[1] == 3:  # (B, C, H, W)
-                pass  # 已经是正确格式
-            elif x.shape[-1] == 3:  # (B, H, W, C) 或 (stack_size, H, W, C)
-                # 需要重新排列为 (B, C, H, W) 或 (stack_size*C, H, W)
-                if x.shape[0] == 4 and x.shape[1] == 96:  # FrameStack: (4, H, W, C)
-                    # FrameStack情况: (4, H, W, C) -> (1, 4*C, H, W)
-                    x = x.permute(0, 3, 1, 2)  # (4, C, H, W)
-                    x = x.reshape(1, x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (1, 4*C, H, W)
-                else:  # 普通情况: (B, H, W, C)
-                    x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
+            # 可能是 (B,H,W,C) / (B,C,H,W) / (S,H,W,C)
+            if x.shape[-1] in (1, 3):  # NHWC-like
+                if x.shape[0] > 8 and x.shape[1] == x.shape[2] and x.shape[-1] in (1, 3):
+                    # (B,H,W,C)
+                    x = x.permute(0, 3, 1, 2)  # -> (B,C,H,W)
+                else:
+                    # (S,H,W,C) 视作单样本堆叠
+                    S, H, W, C = x.shape
+                    x = x.permute(0, 3, 1, 2).reshape(1, S * C, H, W)  # -> (1, S*C, H, W)
             else:
-                # 其他情况，尝试智能处理
-                if x.shape[-1] in [1, 3]:  # 最后一维是通道
-                    x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
-        elif x.dim() == 5:
-            # 处理批量FrameStack: (B, stack_size, H, W, C)
-            batch_size, stack_size, h, w, c = x.shape
-            # 重塑为 (B, stack_size*C, H, W)
-            x = x.permute(0, 1, 4, 2, 3)  # (B, stack_size, C, H, W)
-            x = x.reshape(batch_size, stack_size * c, h, w)  # (B, stack_size*C, H, W)
-        
-        # ensure float32 in [0,1]
+                # 假定已经是 (B,C,H,W)
+                pass
+        elif x.dim() == 3:
+            # (C,H,W) / (H,W,C)
+            if x.shape[0] in (1, 3, 4, 12):
+                x = x.unsqueeze(0)  # -> (1,C,H,W)
+            elif x.shape[-1] in (1, 3):
+                H, W, C = x.shape
+                x = x.permute(2, 0, 1).unsqueeze(0)  # -> (1,C,H,W)
+            else:
+                raise ValueError(f"无法判定输入通道排列，shape={orig_shape}")
+        else:
+            raise ValueError(f"不支持的输入维度: {x.dim()}, shape={orig_shape}")
+
+        # 校验通道
+        expected_c = self.conv[0].in_channels
+        if x.shape[1] != expected_c:
+            raise ValueError(f"通道数不匹配: 输入 {x.shape[1]}, 期望 {expected_c}, 原始形状 {orig_shape}")
+
+        # 无条件 /255 归一化
         if x.dtype != torch.float32:
             x = x.float()
-        # if x.max() > 1.0:
         x = x / 255.0
+
         feats = self.conv(x)
         feats = self.head(feats)
-        return feats  # (B, feature_dim)
+        return feats
 
 class ActorHead(nn.Module):
     """
     Gaussian policy head with Tanh squashing to [-1,1].
     """
-    def __init__(self, feature_dim, act_dim, hidden_sizes=(256,128), init_log_std=-1.5):
+    def __init__(self, feature_dim, act_dim, hidden_sizes=(256,128), init_log_std=-1.0):
         super().__init__()
         mlp = []
         in_dim = feature_dim
@@ -176,7 +185,7 @@ class ActorHead(nn.Module):
     def forward(self, feats):
         h = self.mlp(feats)
         mu = self.mu_layer(h)
-        log_std = self.log_std.clamp(-4.0, 1.0)
+        log_std = self.log_std.clamp(-4, 1)
         return mu, log_std
 
 class CriticHead(nn.Module):
@@ -265,18 +274,29 @@ class CNNActorCriticShared(nn.Module):
     # ---------- CarRacing action mapping ----------
 
     @staticmethod
-    def _map_to_carracing(a_tanh):
+    def _map_to_carracing(a_tanh, prev_action=None, steering_smooth=0.1):
         """
         Input a_tanh in [-1,1]^3.
-        Output:
-          steer in [-1,1]
+        Output with action hygiene:
+          steer in [-1,1] (with smoothing)
           gas   in [0,1]
-          brake in [0,1]
+          brake in [0,1] (with suppression)
         """
         steer = a_tanh[..., 0]
         gas   = (a_tanh[..., 1] + 1) * 0.5  # [-1,1] -> [0,1]
         brake = (a_tanh[..., 2] + 1) * 0.5  # [-1,1] -> [0,1]
-        return torch.stack([steer, gas, brake], dim=-1)
+        
+        # 刹车抑制：当油门>0.1时，抑制刹车
+        brake_suppressed = torch.where(gas > 0.1, brake * 0.1, brake)
+        
+        # 转向平滑：如果有前一个动作，进行平滑
+        if prev_action is not None:
+            prev_steer = prev_action[..., 0]
+            steer_smoothed = (1 - steering_smooth) * steer + steering_smooth * prev_steer
+        else:
+            steer_smoothed = steer
+            
+        return torch.stack([steer_smoothed, gas, brake_suppressed], dim=-1)
 
     @staticmethod
     def _log_prob_carracing_from_tanh(pi, a_env):
@@ -485,15 +505,16 @@ class PPOBuffer:
         all_adv = np.concatenate([t['adv'] for t in self.trajectories])
         all_logp = np.concatenate([t['logp'] for t in self.trajectories])
         all_deltas = np.concatenate([t['deltas'] for t in self.trajectories])
-        
-        all_obs = all_obs.astype(np.float32)
+        # all_obs = all_obs.astype(np.float32)
         
         # 统计GAE数值（规范化前）
         self._print_gae_statistics(all_adv, all_ret, all_deltas)
         
         # 对优势函数进行轻裁剪（winsorize），抑制长尾样本
         all_adv = np.clip(all_adv, -self.adv_clip_range, self.adv_clip_range)
-        print(f"  优势函数裁剪后: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
+        from spinup.utils.mpi_tools import proc_id
+        if proc_id() == 0:
+            print(f"  优势函数裁剪后: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
         
         # 归一化优势函数
         adv_mean, adv_std = mpi_statistics_scalar(all_adv)
@@ -516,7 +537,11 @@ class PPOBuffer:
         }
     
     def _print_gae_statistics(self, adv, ret, deltas):
-        """打印GAE统计信息"""
+        """打印GAE统计信息（仅在进程0打印）"""
+        from spinup.utils.mpi_tools import proc_id
+        if proc_id() != 0:
+            return
+            
         print(f"\n📊 GAE统计信息:")
         print(f"  优势函数 (裁剪前):")
         print(f"    均值: {adv.mean():.6f}")
@@ -558,7 +583,11 @@ class PPOBuffer:
             print(f"  ⚠️  Delta标准差过大，可能存在梯度爆炸！")
     
     def _print_normalized_adv_statistics(self, adv_normalized):
-        """打印规范化后的优势函数统计"""
+        """打印规范化后的优势函数统计（仅在进程0打印）"""
+        from spinup.utils.mpi_tools import proc_id
+        if proc_id() != 0:
+            return
+            
         print(f"  优势函数 (规范化后):")
         print(f"    均值: {adv_normalized.mean():.6f} (应接近0)")
         print(f"    标准差: {adv_normalized.std():.6f} (应接近1)")
@@ -573,7 +602,7 @@ class PPOBuffer:
 
 class PPOAgent:
     def __init__(self, env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
-                 steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
+                 steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.1, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
                  target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
 
@@ -742,13 +771,20 @@ class PPOAgent:
         self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam, adv_clip_range=5.0)
 
         # Set up optimizers for policy and value function
-        # 策略优化器只优化pi头，避免重复优化encoder
-        self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.pi_lr)
-        # 价值优化器优化encoder+v，确保encoder参数参与value优化
-        self.vf_optimizer = Adam(list(self.ac.encoder.parameters()) + list(self.ac.v.parameters()), lr=self.vf_lr)
+        # 策略优化器优化encoder+pi，确保encoder参与策略学习
+        self.pi_optimizer = Adam(list(self.ac.encoder.parameters()) + list(self.ac.pi.parameters()), lr=self.pi_lr)
+        # 价值优化器只优化value头，避免重复优化encoder
+        self.vf_optimizer = Adam(self.ac.v.parameters(), lr=self.vf_lr)
+
+        self.minibatch_size = 2048  # 如果总样本少于 2048，可设为 512 或 1024
+        self.policy_epochs = 3
+        self.value_epochs = 4
+
+        self.kl_history = []
+        self.cf_history = []
 
     def _compute_loss_pi(self, data):
-        """Compute PPO policy loss - 只优化pi头，不涉及encoder"""
+        """Compute PPO policy loss - 优化encoder+pi，确保encoder参与策略学习"""
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
         
         # Move data to device
@@ -757,12 +793,10 @@ class PPOAgent:
         adv = adv.to(self.device)
         logp_old = logp_old.to(self.device)
 
-        # 策略损失 - 只使用pi头，避免重复优化encoder
-        # 先获取特征（不计算梯度，因为encoder由value优化器负责）
-        with torch.no_grad():
-            feats = self.ac.encoder(obs)
+        # 策略损失 - encoder参与梯度计算
+        feats = self.ac.encoder(obs)  # 移除torch.no_grad()，让encoder参与梯度计算
         
-        # 只计算pi头的损失
+        # 计算pi头的损失
         mu, log_std = self.ac.pi(feats)
         pi = self.ac._pi_dist_from_params(mu, log_std)
         logp = pi.log_prob(act)
@@ -781,78 +815,132 @@ class PPOAgent:
         return loss_pi, pi_info
 
     def _compute_loss_v(self, data):
-        """Compute value function loss - 优化encoder和value头
-        让价值函数逼近目标价值，目标价值是通过GAE (Generalized Advantage Estimation) 计算的：
-        self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[:-1]
-        """
         obs, ret = data['obs'], data['ret']
-        
-        # Move data to device
-        obs = obs.to(self.device)
-        ret = ret.to(self.device)
-
-        # 价值损失 - 优化encoder和value头
-        feats = self.ac.encoder(obs)  # encoder参与梯度计算
+        obs = obs.to(self.device); ret = ret.to(self.device)
+        feats = self.ac.encoder(obs).detach()
         v = self.ac.v(feats)
-        return ((v - ret)**2).mean()
+        return F.smooth_l1_loss(v, ret)
 
     def _save_model(self, epoch):
         """Save model at specified epoch"""
         model_path = os.path.join(self.output_dir, f'model_epoch_{epoch}.pth')
         torch.save(self.ac.state_dict(), model_path)
 
+    def _iterate_minibatches(self, data_dict, batch_size, shuffle=True):
+        """
+        将整批数据切分为小批次生成器。data_dict 的每个 value 是 tensor，shape[0]==N。
+        """
+        N = data_dict['obs'].shape[0]
+        idx = np.arange(N)
+        if shuffle:
+            np.random.shuffle(idx)
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            mb_idx = idx[start:end]
+            yield {k: v[mb_idx] for k, v in data_dict.items()}
+
     def _update(self):
-        """Perform PPO update"""
-        # 测量GPU训练时间
+        """
+        小批次 PPO 更新 + 严格 KL 早停 + pi_lr 自适应
+        需要在 _setup_training_components 里设置：
+        self.minibatch_size = 2048 (或更小，如总样本<2048则取512)
+        self.policy_epochs = 3
+        self.value_epochs = 4
+        并在 __init__ 中初始化：
+        self.kl_history = []
+        self.cf_history = []
+        """
+        # 准备数据
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
         gpu_train_start = time.time()
-        
+
         data = self.buf.get()
+        # 预先把数据放到设备上，便于切小批时直接索引
+        for k in data:
+            if isinstance(data[k], torch.Tensor):
+                data[k] = data[k].to(self.device)
 
-        pi_l_old, pi_info_old = self._compute_loss_pi(data)
-        pi_l_old = pi_l_old.item()
-        v_l_old = self._compute_loss_v(data).item()
+        # 计算整批的 old loss（仅日志用途）
+        with torch.no_grad():
+            pi_l_old, pi_info_old = self._compute_loss_pi(data)
+            v_l_old = self._compute_loss_v(data)
+            pi_l_old = pi_l_old.item()
+            v_l_old = v_l_old.item()
 
-        # Train policy with multiple steps of gradient descent
-        for i in range(self.train_pi_iters):
-            self.pi_optimizer.zero_grad()
-            loss_pi, pi_info = self._compute_loss_pi(data)
-            kl = mpi_avg(pi_info['kl'])
-            if kl > 1.5 * self.target_kl:
+        # 策略小批多 epoch
+        kl_list_epoch = []
+        cf_list_epoch = []
+        for pe in range(getattr(self, 'policy_epochs', 3)):
+            # 每个 policy epoch 遍历所有小批
+            for mb in self._iterate_minibatches(data, getattr(self, 'minibatch_size', 2048), shuffle=True):
+                self.pi_optimizer.zero_grad()
+                loss_pi, pi_info = self._compute_loss_pi(mb)
+
+                # KL 取 MPI 平均
+                kl = mpi_avg(pi_info['kl'])
+                cf = mpi_avg(pi_info['cf'])
+                # 严格 KL 早停
+                if kl > self.target_kl:
+                    # 不 step，直接停止本轮剩余小批
+                    break
+
+                loss_pi.backward()
+                mpi_avg_grads(self.ac.encoder)
+                mpi_avg_grads(self.ac.pi)
+                self.pi_optimizer.step()
+
+                kl_list_epoch.append(kl)
+                cf_list_epoch.append(cf)
+            # 若已超过 KL，终止后续 policy epochs
+            if len(kl_list_epoch) > 0 and np.mean(kl_list_epoch) > self.target_kl:
                 break
-            loss_pi.backward()
-            mpi_avg_grads(self.ac.pi)    # average grads across MPI processes (只对pi头)
-            self.pi_optimizer.step()
 
-        # Value function learning
-        for i in range(self.train_v_iters):
-            self.vf_optimizer.zero_grad()
-            loss_v = self._compute_loss_v(data)
-            loss_v.backward()
-            # 对encoder和value头进行梯度平均
-            mpi_avg_grads(self.ac.encoder)    # average encoder grads across MPI processes
-            mpi_avg_grads(self.ac.v)          # average value head grads across MPI processes
-            self.vf_optimizer.step()
+        # 价值小批多 epoch（SmoothL1Loss 内部在 _compute_loss_v 实现）
+        for ve in range(getattr(self, 'value_epochs', 4)):
+            for mb in self._iterate_minibatches(data, getattr(self, 'minibatch_size', 2048), shuffle=True):
+                self.vf_optimizer.zero_grad()
+                loss_v = self._compute_loss_v(mb)
+                loss_v.backward()
+                mpi_avg_grads(self.ac.v)
+                self.vf_optimizer.step()
 
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
-        gpu_train_end = time.time()
-        gpu_train_time = gpu_train_end - gpu_train_start
-        
-        # 记录GPU训练时间
+        gpu_train_time = time.time() - gpu_train_start
         self.epoch_metrics['gpu_times'].append(self.epoch_metrics['gpu_times'][-1] + gpu_train_time)
 
-        # Log changes from update
-        kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
-        
-        # 记录到 TensorBoard 指标中
+        # 记录本 epoch 的 KL/CF
+        mean_kl = float(np.mean(kl_list_epoch)) if kl_list_epoch else 0.0
+        mean_cf = float(np.mean(cf_list_epoch)) if cf_list_epoch else 0.0
+        self.kl_history.append(mean_kl)
+        self.cf_history.append(mean_cf)
+        if len(self.kl_history) > 20:
+            self.kl_history = self.kl_history[-20:]
+            self.cf_history = self.cf_history[-20:]
+
+        # 自适应 pi_lr（每 3 个 epoch 判一次）
+        if len(self.kl_history) >= 3:
+            recent_kl = np.mean(self.kl_history[-3:])
+            recent_cf = np.mean(self.cf_history[-3:])
+            new_lr = None
+            if (recent_kl < 0.5 * self.target_kl) and (recent_cf < 0.1):
+                new_lr = min(self.pi_lr * 1.5, 2e-4)
+            elif (recent_kl > 2.0 * self.target_kl) or (recent_cf > 0.4):
+                new_lr = max(self.pi_lr * 0.5, 1e-5)
+            if new_lr is not None and abs(new_lr - self.pi_lr) / self.pi_lr > 0.01:
+                for g in self.pi_optimizer.param_groups:
+                    g['lr'] = new_lr
+                self.pi_lr = new_lr  # 记录当前 lr
+
+        # 写入指标（注意：这里用 old 的 pi_l_old/v_l_old 作为 epoch 级损失参考）
+        ent_log = pi_info_old['ent'] if isinstance(pi_info_old, dict) and 'ent' in pi_info_old else 0.0
         self.epoch_metrics['loss_pi'].append(pi_l_old)
         self.epoch_metrics['loss_v'].append(v_l_old)
-        self.epoch_metrics['kl'].append(kl)
-        self.epoch_metrics['entropy'].append(ent)
-        self.epoch_metrics['clip_frac'].append(cf)
-        self.epoch_metrics['stop_iter'].append(i)
+        self.epoch_metrics['kl'].append(mean_kl)
+        self.epoch_metrics['entropy'].append(ent_log)
+        self.epoch_metrics['clip_frac'].append(mean_cf)
+        self.epoch_metrics['stop_iter'].append(0)  # 不再用迭代计数作为早停标志
 
     def _log_epoch_info(self, epoch, start_time):
         """Log epoch information"""
@@ -871,12 +959,6 @@ class PPOAgent:
         early_stop = np.mean(self.epoch_metrics['stop_iter']) if self.epoch_metrics['stop_iter'] else 0.0
         early_stop_flag = "True" if early_stop < self.train_pi_iters - 1 else "False"
         
-        # GPU性能监控和时间统计
-        gpu_info = ""
-        if self.device.type == 'cuda':
-            gpu_memory = torch.cuda.memory_allocated() / 1024**2
-            gpu_max_memory = torch.cuda.max_memory_allocated() / 1024**2
-            gpu_info = f" | GPU: {gpu_memory:.1f}/{gpu_max_memory:.1f}MB"
         gpu_time = self.epoch_metrics['gpu_times'][-1] if self.epoch_metrics['gpu_times'] else 0.0
         cpu_time = self.epoch_metrics['cpu_times'][-1] if self.epoch_metrics['cpu_times'] else 0.0
         total_time = gpu_time + cpu_time
@@ -884,7 +966,7 @@ class PPOAgent:
         time_info = f" | GPU: {gpu_time:.2f}s({gpu_ratio:.1f}%)"
         
         # 单行打印，严格对齐
-        print(f"Epoch {epoch:4d} | Return: {ep_return:5.2f} | Policy Loss: {policy_loss:5.4f} | Value Loss: {value_loss:5.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:5.4f} | Early Stop: {early_stop_flag:5s}{time_info}{gpu_info}")
+        print(f"Epoch {epoch:4d} | Return: {ep_return:5.2f} | Policy Loss: {policy_loss:5.4f} | Value Loss: {value_loss:5.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:5.4f} | Early Stop: {early_stop_flag:5s}{time_info}")
         
         # 记录到 TensorBoard - 基本训练指标
         self.tb_writer.add_scalar('Training/Epoch', epoch, epoch)
@@ -942,11 +1024,12 @@ class PPOAgent:
         start_time = time.time()
         o, _ = self.env.reset()
         ep_ret, ep_len = 0, 0
+        prev_action = None  # 用于转向平滑
 
         # Main loop: collect experience in env and update/log each epoch
         num_debug_epochs = 3
         num_debug_steps = 10
-
+        reward_scale = getattr(self, 'reward_scale', 5.0)
         for epoch in range(self.epochs):
             if epoch < num_debug_epochs:
                 print(f"Epoch {epoch} start")
@@ -960,7 +1043,8 @@ class PPOAgent:
                     torch.cuda.synchronize()  # 确保GPU操作完成
                 gpu_start = time.time()
                 
-                # Move observation to device
+                # Move observation to device - 确保观测是uint8格式存储到buffer
+                # 对于CNN，我们让CNN自己处理归一化，这里保持原始格式
                 obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} obs {o.shape}")
@@ -979,11 +1063,12 @@ class PPOAgent:
 
                 # CPU环境交互时间测量
                 cpu_start = time.time()
-                # 将tanh动作转换为环境动作用于环境交互
+                # 将tanh动作转换为环境动作用于环境交互，应用动作卫生处理
                 if hasattr(self.ac, 'car_racing_mode') and self.ac.car_racing_mode:
-                    # 使用CarRacing动作映射
+                    # 使用CarRacing动作映射，包含刹车抑制和转向平滑
                     a_tanh_tensor = torch.FloatTensor(a_tanh)
-                    action_for_env = self.ac._map_to_carracing(a_tanh_tensor).cpu().numpy()
+                    prev_action_tensor = torch.FloatTensor(prev_action) if prev_action is not None else None
+                    action_for_env = self.ac._map_to_carracing(a_tanh_tensor, prev_action_tensor).cpu().numpy()
                 else:
                     # 直接使用tanh动作
                     action_for_env = a_tanh
@@ -996,10 +1081,15 @@ class PPOAgent:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} env action {action_for_env}")
                 
                 next_o, r, terminated, truncated, _ = self.env.step(action_for_env)
+                ep_ret += r
+                r_scaled = r / reward_scale
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} next_o {next_o.shape} r {r} terminated {terminated} truncated {truncated}")
                 cpu_end = time.time()
                 epoch_cpu_time += (cpu_end - cpu_start)
+                
+                # 更新前一个动作用于转向平滑
+                prev_action = action_for_env.copy()
                 
                 d = terminated or truncated  # 环境终止: 自然终止 OR 截断终止
                 ep_ret += r
@@ -1008,7 +1098,10 @@ class PPOAgent:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} ep_ret {ep_ret} ep_len {ep_len}")
 
                 # save and log - 存储tanh空间的动作用于训练一致性
-                self.buf.store(o, a_tanh, r, v, logp)
+                # 确保存储的观测是uint8格式，避免重复归一化
+                if o.dtype != np.uint8:
+                    o = o.astype(np.uint8)
+                self.buf.store(o, a_tanh, r_scaled, v, logp)
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} store")
                 # 记录价值估计到 TensorBoard 指标中
@@ -1055,6 +1148,7 @@ class PPOAgent:
                     if epoch < num_debug_epochs and t < num_debug_steps:
                         print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} reset")
                     ep_ret, ep_len = 0, 0
+                    prev_action = None  # 重置前一个动作
             
             if epoch < num_debug_epochs:
                 print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} end")

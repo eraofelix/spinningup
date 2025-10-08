@@ -38,3 +38,6 @@ source /etc/profile
 source /etc/autodl-motd
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate rl
+
+export OMPI_ALLOW_RUN_AS_ROOT=1
+export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
