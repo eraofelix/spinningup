@@ -17,15 +17,11 @@ from torch.distributions.normal import Normal
 from torch.distributions.categorical import Categorical
 import torch.nn.functional as F
 
-# Constants moved from user_config.py
-DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
-
+DEFAULT_DATA_DIR = "/root/tf-logs" if osp.exists("/root/tf-logs") else osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
 FORCE_DATESTAMP = False
-
 
 def count_vars(module):
     return sum([np.prod(p.shape) for p in module.parameters()])
-
 
 def discount_cumsum(x, discount):
     """
@@ -43,345 +39,6 @@ def discount_cumsum(x, discount):
          x2]
     """
     return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
-
-
-# ============================================================================
-# CNN
-# ============================================================================
-
-
-class SpatialAttention(nn.Module):
-    """
-    空间注意力机制，用于CNN特征图
-    """
-    def __init__(self, in_channels):
-        super(SpatialAttention, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels // 8, 1)
-        self.conv2 = nn.Conv2d(in_channels // 8, 1, 1)
-        self.sigmoid = nn.Sigmoid()
-        
-    def forward(self, x):
-        # x: (B, C, H, W)
-        attention = self.conv1(x)
-        attention = F.relu(attention)
-        attention = self.conv2(attention)
-        attention = self.sigmoid(attention)
-        
-        # 应用注意力权重
-        return x * attention
-
-
-class ChannelAttention(nn.Module):
-    """
-    通道注意力机制
-    """
-    def __init__(self, in_channels, reduction=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        
-        self.fc = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // reduction, in_channels, 1, bias=False)
-        )
-        self.sigmoid = nn.Sigmoid()
-        
-    def forward(self, x):
-        # x: (B, C, H, W)
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
-        attention = self.sigmoid(avg_out + max_out)
-        
-        return x * attention
-
-
-class CBAM(nn.Module):
-    """
-    Convolutional Block Attention Module
-    结合通道注意力和空间注意力
-    """
-    def __init__(self, in_channels, reduction=16):
-        super(CBAM, self).__init__()
-        self.channel_attention = ChannelAttention(in_channels, reduction)
-        self.spatial_attention = SpatialAttention(in_channels)
-        
-    def forward(self, x):
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
-        return x
-
-
-class CNNFeatureExtractor(nn.Module):
-    """
-    可配置的CNN特征提取器，支持命令行参数控制
-    专门为96x96x3的CarRacing图像设计
-    """
-    def __init__(self, input_channels=3, feature_dim=256, cnn_channels=[16, 32, 64, 128], 
-                 attention_reduction=8, dropout_rate=0.1):
-        super(CNNFeatureExtractor, self).__init__()
-        
-        # 可配置的卷积层设计
-        layers = []
-        prev_channels = input_channels
-        
-        # 第一层: 96x96 -> 48x48
-        layers.extend([
-            nn.Conv2d(prev_channels, cnn_channels[0], kernel_size=8, stride=4, padding=2),
-            nn.BatchNorm2d(cnn_channels[0]),
-            nn.ReLU(inplace=True)
-        ])
-        prev_channels = cnn_channels[0]
-        
-        # 第二层: 48x48 -> 24x24  
-        layers.extend([
-            nn.Conv2d(prev_channels, cnn_channels[1], kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(cnn_channels[1]),
-            nn.ReLU(inplace=True)
-        ])
-        prev_channels = cnn_channels[1]
-        
-        # 第三层: 24x24 -> 12x12
-        layers.extend([
-            nn.Conv2d(prev_channels, cnn_channels[2], kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(cnn_channels[2]),
-            nn.ReLU(inplace=True)
-        ])
-        prev_channels = cnn_channels[2]
-        
-        # 第四层: 12x12 -> 6x6
-        layers.extend([
-            nn.Conv2d(prev_channels, cnn_channels[3], kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(cnn_channels[3]),
-            nn.ReLU(inplace=True)
-        ])
-        
-        self.conv_layers = nn.Sequential(*layers)
-        
-        # 可配置的注意力机制
-        self.attention = CBAM(cnn_channels[3], reduction=attention_reduction)
-        
-        # 全局平均池化 + 全连接层
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(cnn_channels[3], feature_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate)
-        )
-        
-        self.feature_dim = feature_dim
-        
-    def forward(self, x):
-        # x: (B, C, H, W) 或 (B, H, W, C)
-        if len(x.shape) == 4 and x.shape[-1] == 3:
-            # 如果是 (B, H, W, C) 格式，转换为 (B, C, H, W)
-            x = x.permute(0, 3, 1, 2)
-        
-        # 确保输入是float类型
-        if x.dtype != torch.float32:
-            x = x.float()
-        
-        # 卷积特征提取
-        features = self.conv_layers(x)
-        
-        # 应用注意力机制
-        attended_features = self.attention(features)
-        
-        # 全局池化
-        pooled = self.global_pool(attended_features)
-        pooled = pooled.view(pooled.size(0), -1)
-        
-        # 全连接层
-        output = self.fc(pooled)
-        
-        return output
-
-
-class CNNActor(nn.Module):
-    """
-    基于CNN的Actor网络，支持连续和离散动作空间
-    """
-    def __init__(self, obs_space, act_space, feature_dim=256, hidden_sizes=(128, 64), 
-                 cnn_channels=[16, 32, 64, 128], attention_reduction=8, dropout_rate=0.1):
-        super(CNNActor, self).__init__()
-        
-        self.obs_space = obs_space
-        self.act_space = act_space
-        
-        # CNN特征提取器
-        self.cnn_extractor = CNNFeatureExtractor(
-            input_channels=3, 
-            feature_dim=feature_dim,
-            cnn_channels=cnn_channels,
-            attention_reduction=attention_reduction,
-            dropout_rate=dropout_rate
-        )
-        
-        # 策略网络
-        if isinstance(act_space, Box):
-            # 连续动作空间
-            act_dim = act_space.shape[0]
-            print(f"🎯 检测到连续动作空间，维度: {act_dim}")
-            
-            # 为每个动作维度创建独立的log_std参数
-            self.log_std = nn.Parameter(torch.zeros(act_dim))
-            
-            # 构建策略网络
-            layers = []
-            prev_size = feature_dim
-            for hidden_size in hidden_sizes:
-                layers.extend([
-                    nn.Linear(prev_size, hidden_size),
-                    nn.ReLU(),
-                    nn.Dropout(0.1)
-                ])
-                prev_size = hidden_size
-            layers.append(nn.Linear(prev_size, act_dim))
-            self.policy_net = nn.Sequential(*layers)
-            
-        elif isinstance(act_space, Discrete):
-            # 离散动作空间
-            act_dim = act_space.n
-            print(f"🎯 检测到离散动作空间，维度: {act_dim}")
-            
-            layers = []
-            prev_size = feature_dim
-            for hidden_size in hidden_sizes:
-                layers.extend([
-                    nn.Linear(prev_size, hidden_size),
-                    nn.ReLU(),
-                    nn.Dropout(0.1)
-                ])
-                prev_size = hidden_size
-            layers.append(nn.Linear(prev_size, act_dim))
-            self.policy_net = nn.Sequential(*layers)
-        else:
-            raise NotImplementedError(f"Action space {act_space} not supported")
-    
-    def _distribution(self, obs):
-        # 提取CNN特征
-        features = self.cnn_extractor(obs)
-        
-        if isinstance(self.act_space, Box):
-            # 连续动作
-            mu = self.policy_net(features)
-            std = torch.exp(self.log_std)
-            return Normal(mu, std)
-        else:
-            # 离散动作
-            logits = self.policy_net(features)
-            return Categorical(logits=logits)
-    
-    def _log_prob_from_distribution(self, pi, act):
-        if isinstance(self.act_space, Box):
-            return pi.log_prob(act).sum(axis=-1)
-        else:
-            return pi.log_prob(act)
-    
-    def forward(self, obs, act=None):
-        pi = self._distribution(obs)
-        logp_a = None
-        if act is not None:
-            logp_a = self._log_prob_from_distribution(pi, act)
-        return pi, logp_a
-
-
-class CNNCritic(nn.Module):
-    """
-    基于CNN的Critic网络
-    """
-    def __init__(self, obs_space, feature_dim=256, hidden_sizes=(128, 64),
-                 cnn_channels=[16, 32, 64, 128], attention_reduction=8, dropout_rate=0.1):
-        super(CNNCritic, self).__init__()
-        
-        # CNN特征提取器
-        self.cnn_extractor = CNNFeatureExtractor(
-            input_channels=3,
-            feature_dim=feature_dim,
-            cnn_channels=cnn_channels,
-            attention_reduction=attention_reduction,
-            dropout_rate=dropout_rate
-        )
-        
-        # 价值网络
-        layers = []
-        prev_size = feature_dim
-        for hidden_size in hidden_sizes:
-            layers.extend([
-                nn.Linear(prev_size, hidden_size),
-                nn.ReLU(),
-                nn.Dropout(0.1)
-            ])
-            prev_size = hidden_size
-        layers.append(nn.Linear(prev_size, 1))
-        self.value_net = nn.Sequential(*layers)
-    
-    def forward(self, obs):
-        # 提取CNN特征
-        features = self.cnn_extractor(obs)
-        
-        # 计算价值
-        value = self.value_net(features)
-        return torch.squeeze(value, -1)
-
-
-class CNNActorCritic(nn.Module):
-    """
-    基于CNN的Actor-Critic网络，带注意力机制
-    专门为CarRacing-v3等图像观测环境设计
-    """
-    def __init__(self, observation_space, action_space, 
-                 feature_dim=256, hidden_sizes=(128, 64), cnn_channels=[16, 32, 64, 128],
-                 attention_reduction=8, dropout_rate=0.1):
-        super(CNNActorCritic, self).__init__()
-        
-        self.observation_space = observation_space
-        self.action_space = action_space
-        
-        # 创建共享的CNN特征提取器
-        self.cnn_extractor = CNNFeatureExtractor(
-            input_channels=3,
-            feature_dim=feature_dim,
-            cnn_channels=cnn_channels,
-            attention_reduction=attention_reduction,
-            dropout_rate=dropout_rate
-        )
-        
-        # Actor网络
-        self.pi = CNNActor(observation_space, action_space, feature_dim, hidden_sizes,
-                          cnn_channels, attention_reduction, dropout_rate)
-        
-        # Critic网络  
-        self.v = CNNCritic(observation_space, feature_dim, hidden_sizes,
-                          cnn_channels, attention_reduction, dropout_rate)
-    
-    def step(self, obs):
-        """
-        执行一步：根据观测选择动作
-        """
-        with torch.no_grad():
-            # 确保输入格式正确
-            if len(obs.shape) == 3:
-                obs = obs.unsqueeze(0)  # 添加batch维度
-            
-            pi = self.pi._distribution(obs)
-            a = pi.sample()
-            logp_a = self.pi._log_prob_from_distribution(pi, a)
-            v = self.v(obs)
-        
-        # 返回numpy数组
-        return a.cpu().numpy(), v.cpu().numpy(), logp_a.cpu().numpy()
-    
-    def act(self, obs):
-        """
-        仅获取动作，不计算其他信息
-        """
-        return self.step(obs)[0]
-
-
-# ============================================================================
-# SimpleSharedCNN
-# ============================================================================
 
 def atanh(x, eps=1e-6):
     x = x.clamp(-1 + eps, 1 - eps)
@@ -618,7 +275,7 @@ class CNNActorCriticShared(nn.Module):
     def step(self, obs, return_env_action=True):
         """
         obs: (B,3,H,W) or (3,H,W). Returns:
-          - action np.array
+          - action np.array (tanh space for training consistency)
           - value np.array
           - logp np.array (for the exact action fed back into policy gradient)
         If return_env_action=True and car_racing_mode, returns mapped env action.
@@ -630,14 +287,13 @@ class CNNActorCriticShared(nn.Module):
             if self.is_box:
                 a_tanh = pi.sample()  # in [-1,1]
                 v = self.v(feats)
+                logp = pi.log_prob(a_tanh)  # 统一使用tanh空间的log_prob
+                
                 if self.car_racing_mode and return_env_action:
                     a_env = self._map_to_carracing(a_tanh)
-                    # 用 a_tanh 的 log_prob 做 PPO（ratio 不变），也可以用精确 env log_prob：
-                    # logp = self._log_prob_carracing_from_tanh(pi, a_env)
-                    logp = pi.log_prob(a_tanh)
+                    # 返回环境动作用于环境交互，但logp始终是tanh空间
                     return a_env.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
                 else:
-                    logp = pi.log_prob(a_tanh)
                     return a_tanh.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
             else:
                 a = pi.sample()
@@ -677,20 +333,7 @@ class CNNActorCriticShared(nn.Module):
         feats = self.encoder(obs)
         return self.v(feats)
 
-
-# ============================================================================
-# PPO Buffer and Agent classes
-# ============================================================================
-
 class PPOBuffer:
-    """
-    A buffer for storing trajectories experienced by a PPO agent interacting
-    with the environment, and using Generalized Advantage Estimation (GAE-Lambda)
-    for calculating the advantages of state-action pairs.
-    
-    使用轨迹列表方案，无需维护指针，逻辑更简单。
-    """
-
     def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
         self.gamma, self.lam = gamma, lam
         self.max_size = size
@@ -818,14 +461,7 @@ class PPOBuffer:
             'logp': torch.as_tensor(all_logp, dtype=torch.float32)
         }
 
-
 class PPOAgent:
-    """
-    Proximal Policy Optimization (by clipping) Agent
-    
-    with early stopping based on approximate KL
-    """
-    
     def __init__(self, env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
@@ -985,42 +621,8 @@ class PPOAgent:
     def _setup_training_components(self):
         """Setup training components"""
         num_procs_val = num_procs()
-        
-        # 根据环境类型智能调整最小步数
-        if self.min_steps_per_proc is not None:
-            # 用户指定了最小步数
-            min_steps_per_proc = self.min_steps_per_proc
-        elif hasattr(self.env, 'spec') and self.env.spec.id:
-            env_name = self.env.spec.id.lower()
-            if 'car' in env_name or 'racing' in env_name:
-                # 赛车环境需要更多步数
-                min_steps_per_proc = max(self.max_ep_len * 3, 2000)
-            elif 'mujoco' in env_name or 'gym' in env_name:
-                # MuJoCo环境相对较短
-                min_steps_per_proc = max(self.max_ep_len * 2, 1000)
-            else:
-                # 默认设置
-                min_steps_per_proc = max(self.max_ep_len * 2, 1000)
-        else:
-            # 基于观测空间类型判断
-            if len(self.env.observation_space.shape) == 3:
-                # 图像环境（如CarRacing）需要更多步数
-                min_steps_per_proc = max(self.max_ep_len * 3, 2000)
-            else:
-                # 向量环境
-                min_steps_per_proc = max(self.max_ep_len * 2, 1000)
-            
-        # 计算实际步数分配
-        base_steps_per_proc = int(self.steps_per_epoch / num_procs_val)
-        self.local_steps_per_epoch = max(base_steps_per_proc, min_steps_per_proc)
-        
-        # 如果调整后总步数增加，给出警告
-        total_adjusted_steps = self.local_steps_per_epoch * num_procs_val
-        if total_adjusted_steps > self.steps_per_epoch:
-            print(f"⚠️  步数调整: 原计划={self.steps_per_epoch}, 调整后={total_adjusted_steps}")
-            print(f"🔧 进程步数分配: 总步数={total_adjusted_steps}, 进程数={num_procs_val}, 每进程步数={self.local_steps_per_epoch}")
-        else:
-            print(f"🔧 进程步数分配: 总步数={self.steps_per_epoch}, 进程数={num_procs_val}, 每进程步数={self.local_steps_per_epoch}")
+
+        self.local_steps_per_epoch = self.steps_per_epoch
         self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam)
 
         # Set up optimizers for policy and value function
@@ -1041,8 +643,8 @@ class PPOAgent:
         # CNN networks expect image format (B, C, H, W) or (B, H, W, C)
         # No flattening needed for CNN-based networks
 
-        # Policy loss - 使用CNNActorCriticShared接口
-        pi, logp = self.ac.pi_and_logp(obs, act, assume_env_action=True)
+        # Policy loss - 使用CNNActorCriticShared接口，统一使用tanh空间
+        pi, logp = self.ac.pi_and_logp(obs, act, assume_env_action=False)
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-self.clip_ratio, 1+self.clip_ratio) * adv
         loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
@@ -1217,8 +819,8 @@ class PPOAgent:
         ep_ret, ep_len = 0, 0
 
         # Main loop: collect experience in env and update/log each epoch
-        num_debug_epochs = 1
-        num_debug_steps = 0
+        num_debug_epochs = 3
+        num_debug_steps = 10
 
         for epoch in range(self.epochs):
             if epoch < num_debug_epochs:
@@ -1237,9 +839,11 @@ class PPOAgent:
                 obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} obs {o.shape}")
-                a, v, logp = self.ac.step(obs_tensor)
+                
+                # 获取tanh空间的动作和logp（用于训练）
+                a_tanh, v, logp = self.ac.step(obs_tensor, return_env_action=False)
                 if epoch < num_debug_epochs and t < num_debug_steps:
-                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} action {a} value {v} logp {logp}")
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} tanh action {a_tanh} value {v} logp {logp}")
                 
                 if self.device.type == 'cuda':
                     torch.cuda.synchronize()  # 确保GPU操作完成
@@ -1250,11 +854,22 @@ class PPOAgent:
 
                 # CPU环境交互时间测量
                 cpu_start = time.time()
-                # 确保动作是正确的形状：从 (1, 3) 转换为 (3,)
-                if len(a.shape) > 1 and a.shape[0] == 1:
-                    action_for_env = a[0]  # 取第一个（也是唯一的）动作
+                # 将tanh动作转换为环境动作用于环境交互
+                if hasattr(self.ac, 'car_racing_mode') and self.ac.car_racing_mode:
+                    # 使用CarRacing动作映射
+                    a_tanh_tensor = torch.FloatTensor(a_tanh)
+                    action_for_env = self.ac._map_to_carracing(a_tanh_tensor).cpu().numpy()
                 else:
-                    action_for_env = a
+                    # 直接使用tanh动作
+                    action_for_env = a_tanh
+                
+                # 确保动作是正确的形状
+                if len(action_for_env.shape) > 1 and action_for_env.shape[0] == 1:
+                    action_for_env = action_for_env[0]
+                
+                if epoch < num_debug_epochs and t < num_debug_steps:
+                    print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} env action {action_for_env}")
+                
                 next_o, r, terminated, truncated, _ = self.env.step(action_for_env)
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} next_o {next_o.shape} r {r} terminated {terminated} truncated {truncated}")
@@ -1267,8 +882,8 @@ class PPOAgent:
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} ep_ret {ep_ret} ep_len {ep_len}")
 
-                # save and log
-                self.buf.store(o, a, r, v, logp)
+                # save and log - 存储tanh空间的动作用于训练一致性
+                self.buf.store(o, a_tanh, r, v, logp)
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} store")
                 # 记录价值估计到 TensorBoard 指标中
@@ -1315,7 +930,8 @@ class PPOAgent:
                     if epoch < num_debug_epochs and t < num_debug_steps:
                         print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} reset")
                     ep_ret, ep_len = 0, 0
-            
+            if epoch < num_debug_epochs:
+                print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} end")
             # 记录时间统计
             self.epoch_metrics['gpu_times'].append(epoch_gpu_time)
             self.epoch_metrics['cpu_times'].append(epoch_cpu_time)
@@ -1325,24 +941,30 @@ class PPOAgent:
                 self._save_model(epoch)
 
             # Perform PPO update!
+            if epoch < num_debug_epochs:
+                print(f"Epoch {epoch} update start")
             self._update()
+            if epoch < num_debug_epochs:
+                print(f"Epoch {epoch} update end")
 
             # Log epoch info
+            if epoch < num_debug_epochs:
+                print(f"Epoch {epoch} log epoch info start")
             self._log_epoch_info(epoch, start_time)
+            if epoch < num_debug_epochs:
+                print(f"Epoch {epoch} log epoch info end")
         
         # Close TensorBoard writer
         self.tb_writer.close()
 
-
 def ppo(env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
-        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
+        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=100,
         target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
                     lam, max_ep_len, target_kl, save_freq, device, min_steps_per_proc)
     agent.train()
-
 
 if __name__ == '__main__':
     import argparse
