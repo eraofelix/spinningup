@@ -786,19 +786,17 @@ class PPOAgent:
         if self.device.type == 'cuda':
             gpu_memory = torch.cuda.memory_allocated() / 1024**2
             gpu_max_memory = torch.cuda.max_memory_allocated() / 1024**2
-            gpu_info = f" | GPU: {gpu_memory:.1f}MB/{gpu_max_memory:.1f}MB"
+            gpu_info = f" | GPU: {gpu_memory:.1f}/{gpu_max_memory:.1f}MB"
         
         # 时间统计
         gpu_time = self.epoch_metrics['gpu_times'][-1] if self.epoch_metrics['gpu_times'] else 0.0
         cpu_time = self.epoch_metrics['cpu_times'][-1] if self.epoch_metrics['cpu_times'] else 0.0
         total_time = gpu_time + cpu_time
-        gpu_ratio = (gpu_time / total_time * 100) if total_time > 0 else 0
-        cpu_ratio = (cpu_time / total_time * 100) if total_time > 0 else 0
-        
-        time_info = f" | GPU: {gpu_time:.2f}s({gpu_ratio:.1f}%) | CPU: {cpu_time:.2f}s({cpu_ratio:.1f}%)"
+        gpu_ratio = (gpu_time / total_time * 100) if total_time > 0 else 0        
+        time_info = f" | GPU: {gpu_time:.2f}s({gpu_ratio:.1f}%)"
         
         # 单行打印，严格对齐
-        print(f"Epoch {epoch:4d} | Return: {ep_return:8.2f} | Policy Loss: {policy_loss:8.4f} | Value Loss: {value_loss:8.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:8.4f} | Early Stop: {early_stop_flag:5s}{time_info}{gpu_info}")
+        print(f"Epoch {epoch:4d} | Return: {ep_return:5.2f} | Policy Loss: {policy_loss:5.4f} | Value Loss: {value_loss:5.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:5.4f} | Early Stop: {early_stop_flag:5s}{time_info}{gpu_info}")
         
         # 记录到 TensorBoard
         # 基本训练指标

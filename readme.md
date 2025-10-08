@@ -2,7 +2,7 @@ ssh-keygen -t ed25519 -C "your_email@example.com"
 
 cat ~/.ssh/id_ed25519.pub
 
-rm ~/.bashrc && ln -s bashrc ~/.bashrc
+rm ~/.bashrc && ln -s /root/spinningup/bashrc ~/.bashrc
 
 git config --global user.email "you@example.com"
 
