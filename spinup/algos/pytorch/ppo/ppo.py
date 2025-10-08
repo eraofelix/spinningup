@@ -507,14 +507,21 @@ class PPOBuffer:
         all_deltas = np.concatenate([t['deltas'] for t in self.trajectories])
         # all_obs = all_obs.astype(np.float32)
         
-        # 统计GAE数值（规范化前）
-        self._print_gae_statistics(all_adv, all_ret, all_deltas)
+        # 统计GAE数值（规范化前）- 每10个epoch打印一次
+        from spinup.utils.mpi_tools import proc_id
+        if proc_id() == 0:
+            # 获取当前epoch信息（从训练循环中传递）
+            current_epoch = getattr(self, '_current_epoch', 0)
+            if current_epoch % 10 == 0:
+                self._print_gae_statistics(all_adv, all_ret, all_deltas)
         
         # 对优势函数进行轻裁剪（winsorize），抑制长尾样本
         all_adv = np.clip(all_adv, -self.adv_clip_range, self.adv_clip_range)
         from spinup.utils.mpi_tools import proc_id
         if proc_id() == 0:
-            print(f"  优势函数裁剪后: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
+            current_epoch = getattr(self, '_current_epoch', 0)
+            if current_epoch % 10 == 0:
+                print(f"  优势函数裁剪后: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
         
         # 归一化优势函数
         adv_mean, adv_std = mpi_statistics_scalar(all_adv)
@@ -526,11 +533,16 @@ class PPOBuffer:
             all_adv = all_adv * boost_factor
             from spinup.utils.mpi_tools import proc_id
             if proc_id() == 0:
-                print(f"  优势函数增强: std={adv_std:.3f} < 0.95, 应用增强系数 {boost_factor}")
-                print(f"  增强后优势函数: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
+                current_epoch = getattr(self, '_current_epoch', 0)
+                if current_epoch % 10 == 0:
+                    print(f"  优势函数增强: std={adv_std:.3f} < 0.95, 应用增强系数 {boost_factor}")
+                    print(f"  增强后优势函数: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
         
-        # 验证规范化后的优势函数
-        self._print_normalized_adv_statistics(all_adv)
+        # 验证规范化后的优势函数 - 每10个epoch打印一次
+        if proc_id() == 0:
+            current_epoch = getattr(self, '_current_epoch', 0)
+            if current_epoch % 10 == 0:
+                self._print_normalized_adv_statistics(all_adv)
         
         # 清空轨迹和重置计数器
         self.trajectories = []
@@ -769,7 +781,7 @@ class PPOAgent:
             var_counts = tuple(count_vars(module) for module in [self.ac.pi, self.ac.v])
             print(f'\nNumber of parameters: pi: {var_counts[0]}, v: {var_counts[1]}')
             print("=" * 180)
-            print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | Early Stop | GPU Time | CPU Time | GPU Memory")
+            print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | ClipFrac  | Early Stop | GPU Time | CPU Time | GPU Memory")
             print("=" * 180)
 
     def _setup_training_components(self):
@@ -965,6 +977,7 @@ class PPOAgent:
         value_loss = np.mean(self.epoch_metrics['loss_v']) if self.epoch_metrics['loss_v'] else 0.0
         kl_div = np.mean(self.epoch_metrics['kl']) if self.epoch_metrics['kl'] else 0.0
         entropy = np.mean(self.epoch_metrics['entropy']) if self.epoch_metrics['entropy'] else 0.0
+        clip_frac = np.mean(self.epoch_metrics['clip_frac']) if self.epoch_metrics['clip_frac'] else 0.0
         early_stop = np.mean(self.epoch_metrics['stop_iter']) if self.epoch_metrics['stop_iter'] else 0.0
         early_stop_flag = "True" if early_stop < self.train_pi_iters - 1 else "False"
         
@@ -975,7 +988,7 @@ class PPOAgent:
         time_info = f" | GPU: {gpu_time:.2f}s({gpu_ratio:.1f}%)"
         
         # 单行打印，严格对齐
-        print(f"Epoch {epoch:4d} | Return: {ep_return:5.2f} | Policy Loss: {policy_loss:5.4f} | Value Loss: {value_loss:5.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:5.4f} | Early Stop: {early_stop_flag:5s}{time_info}")
+        print(f"Epoch {epoch:4d} | Return: {ep_return:5.2f} | Policy Loss: {policy_loss:5.4f} | Value Loss: {value_loss:5.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:5.4f} | ClipFrac: {clip_frac:5.4f} | Early Stop: {early_stop_flag:5s}{time_info}")
         
         # 记录到 TensorBoard - 基本训练指标
         self.tb_writer.add_scalar('Training/Epoch', epoch, epoch)
@@ -1036,10 +1049,13 @@ class PPOAgent:
         prev_action = None  # 用于转向平滑
 
         # Main loop: collect experience in env and update/log each epoch
-        num_debug_epochs = 3
+        num_debug_epochs = 0
         num_debug_steps = 3
         reward_scale = getattr(self, 'reward_scale', 3.0)
         for epoch in range(self.epochs):
+            # 设置当前epoch信息，供PPOBuffer使用
+            self.buf._current_epoch = epoch
+            
             if epoch < num_debug_epochs:
                 print(f"Epoch {epoch} start")
             epoch_gpu_time = 0.0
