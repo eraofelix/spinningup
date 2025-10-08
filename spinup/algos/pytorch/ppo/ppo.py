@@ -4,7 +4,9 @@ from torch.optim import Adam
 import gymnasium as gym
 import gymnasium_robotics
 import time
-# MPI imports will be done conditionally when needed
+# MPI imports
+from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
+from spinup.utils.mpi_tools import proc_id, num_procs, mpi_statistics_scalar, mpi_avg, mpi_fork
 from torch.utils.tensorboard import SummaryWriter
 import os
 import os.path as osp
@@ -334,11 +336,7 @@ class PPOBuffer:
         all_obs = all_obs.astype(np.float32)
         
         # 归一化优势函数
-        if use_mpi:
-            from spinup.utils.mpi_tools import mpi_statistics_scalar
-            adv_mean, adv_std = mpi_statistics_scalar(all_adv)
-        else:
-            adv_mean, adv_std = np.mean(all_adv), np.std(all_adv)
+        adv_mean, adv_std = mpi_statistics_scalar(all_adv)
         all_adv = (all_adv - adv_mean) / adv_std
         
         # 清空轨迹和重置计数器
@@ -365,7 +363,7 @@ class PPOAgent:
     def __init__(self, env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-                 target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True, device=None,
+                 target_kl=0.05, logger_kwargs=dict(), save_freq=100, device=None,
                  min_steps_per_proc=None):
         """
         Initialize PPO Agent
@@ -416,8 +414,6 @@ class PPOAgent:
             save_freq (int): How often (in terms of gap between epochs) to save
                 the current policy and value function.
                 
-            use_mpi (bool): Whether to use MPI for parallel training. If False,
-                runs in single-process mode.
         """
         # Store parameters
         self.env_fn = env_fn
@@ -437,7 +433,6 @@ class PPOAgent:
         self.target_kl = target_kl
         self.logger_kwargs = logger_kwargs
         self.save_freq = save_freq
-        self.use_mpi = use_mpi
         self.min_steps_per_proc = min_steps_per_proc
         
         # Setup device (GPU/CPU)
@@ -471,21 +466,14 @@ class PPOAgent:
     
     def _setup_environment(self):
         """Setup environment and related components"""
-        if self.use_mpi:
-            # Import MPI modules only when needed
-            from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi
-            from spinup.utils.mpi_tools import proc_id
-            
-            # Special function to avoid certain slowdowns from PyTorch + MPI combo.
-            print(f"🔧 进程 {proc_id()}: 开始设置 PyTorch MPI...")
-            try:
-                setup_pytorch_for_mpi()
-                print(f"✅ 进程 {proc_id()}: PyTorch MPI 设置完成")
-            except Exception as e:
-                print(f"❌ 进程 {proc_id()}: PyTorch MPI 设置失败: {e}")
-                raise
-        else:
-            print("🚫 禁用MPI模式: 跳过MPI设置")
+        # Special function to avoid certain slowdowns from PyTorch + MPI combo.
+        print(f"🔧 进程 {proc_id()}: 开始设置 PyTorch MPI...")
+        try:
+            setup_pytorch_for_mpi()
+            print(f"✅ 进程 {proc_id()}: PyTorch MPI 设置完成")
+        except Exception as e:
+            print(f"❌ 进程 {proc_id()}: PyTorch MPI 设置失败: {e}")
+            raise
 
         # 创建带时间戳的输出目录
         from datetime import datetime
@@ -548,7 +536,7 @@ class PPOAgent:
         }
 
         # Random seed
-        seed = self.seed + 10000 * proc_id() if self.use_mpi else self.seed
+        seed = self.seed + 10000 * proc_id()
         torch.manual_seed(seed)
         np.random.seed(seed)
 
@@ -576,74 +564,56 @@ class PPOAgent:
         self.ac = self.ac.to(self.device)
         print(f"📱 模型已移动到设备: {self.device}")
 
-        # Sync params across processes (only if using MPI)
-        if self.use_mpi:
-            from spinup.utils.mpi_pytorch import sync_params
-            sync_params(self.ac)
+        # Sync params across processes
+        sync_params(self.ac)
 
-        # Count variables (only for first process or single process mode)
-        if not self.use_mpi:
-            # Single process mode
+        # Count variables (only for first process)
+        if proc_id() == 0:
             var_counts = tuple(count_vars(module) for module in [self.ac.pi, self.ac.v])
             print(f'\nNumber of parameters: pi: {var_counts[0]}, v: {var_counts[1]}')
             print("=" * 180)
             print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | Early Stop | GPU Time | CPU Time | GPU Memory")
             print("=" * 180)
-        else:
-            # MPI mode
-            from spinup.utils.mpi_tools import proc_id
-            if proc_id() == 0:
-                var_counts = tuple(count_vars(module) for module in [self.ac.pi, self.ac.v])
-                print(f'\nNumber of parameters: pi: {var_counts[0]}, v: {var_counts[1]}')
-                print("=" * 180)
-                print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | Early Stop | GPU Time | CPU Time | GPU Memory")
-                print("=" * 180)
 
     def _setup_training_components(self):
         """Setup training components"""
-        # Set up experience buffer
-        if self.use_mpi:
-            from spinup.utils.mpi_tools import num_procs
-            # 更合理的步数分配：确保每个进程有足够的步数收集完整轨迹
-            num_procs_val = num_procs()
-            
-            # 根据环境类型智能调整最小步数
-            if self.min_steps_per_proc is not None:
-                # 用户指定了最小步数
-                min_steps_per_proc = self.min_steps_per_proc
-            elif hasattr(self.env, 'spec') and self.env.spec.id:
-                env_name = self.env.spec.id.lower()
-                if 'car' in env_name or 'racing' in env_name:
-                    # 赛车环境需要更多步数
-                    min_steps_per_proc = max(self.max_ep_len * 3, 2000)
-                elif 'mujoco' in env_name or 'gym' in env_name:
-                    # MuJoCo环境相对较短
-                    min_steps_per_proc = max(self.max_ep_len * 2, 1000)
-                else:
-                    # 默认设置
-                    min_steps_per_proc = max(self.max_ep_len * 2, 1000)
+        num_procs_val = num_procs()
+        
+        # 根据环境类型智能调整最小步数
+        if self.min_steps_per_proc is not None:
+            # 用户指定了最小步数
+            min_steps_per_proc = self.min_steps_per_proc
+        elif hasattr(self.env, 'spec') and self.env.spec.id:
+            env_name = self.env.spec.id.lower()
+            if 'car' in env_name or 'racing' in env_name:
+                # 赛车环境需要更多步数
+                min_steps_per_proc = max(self.max_ep_len * 3, 2000)
+            elif 'mujoco' in env_name or 'gym' in env_name:
+                # MuJoCo环境相对较短
+                min_steps_per_proc = max(self.max_ep_len * 2, 1000)
             else:
-                # 基于观测空间类型判断
-                if len(self.env.observation_space.shape) == 3:
-                    # 图像环境（如CarRacing）需要更多步数
-                    min_steps_per_proc = max(self.max_ep_len * 3, 2000)
-                else:
-                    # 向量环境
-                    min_steps_per_proc = max(self.max_ep_len * 2, 1000)
-            
-            # 计算实际步数分配
-            base_steps_per_proc = int(self.steps_per_epoch / num_procs_val)
-            self.local_steps_per_epoch = max(base_steps_per_proc, min_steps_per_proc)
-            
-            # 如果调整后总步数增加，给出警告
-            total_adjusted_steps = self.local_steps_per_epoch * num_procs_val
-            if total_adjusted_steps > self.steps_per_epoch:
-                print(f"⚠️  步数调整: 原计划={self.steps_per_epoch}, 调整后={total_adjusted_steps}")
-                print(f"🔧 进程步数分配: 总步数={total_adjusted_steps}, 进程数={num_procs_val}, 每进程步数={self.local_steps_per_epoch}")
-            else:
-                print(f"🔧 进程步数分配: 总步数={self.steps_per_epoch}, 进程数={num_procs_val}, 每进程步数={self.local_steps_per_epoch}")
+                # 默认设置
+                min_steps_per_proc = max(self.max_ep_len * 2, 1000)
         else:
-            self.local_steps_per_epoch = self.steps_per_epoch
+            # 基于观测空间类型判断
+            if len(self.env.observation_space.shape) == 3:
+                # 图像环境（如CarRacing）需要更多步数
+                min_steps_per_proc = max(self.max_ep_len * 3, 2000)
+            else:
+                # 向量环境
+                min_steps_per_proc = max(self.max_ep_len * 2, 1000)
+            
+        # 计算实际步数分配
+        base_steps_per_proc = int(self.steps_per_epoch / num_procs_val)
+        self.local_steps_per_epoch = max(base_steps_per_proc, min_steps_per_proc)
+        
+        # 如果调整后总步数增加，给出警告
+        total_adjusted_steps = self.local_steps_per_epoch * num_procs_val
+        if total_adjusted_steps > self.steps_per_epoch:
+            print(f"⚠️  步数调整: 原计划={self.steps_per_epoch}, 调整后={total_adjusted_steps}")
+            print(f"🔧 进程步数分配: 总步数={total_adjusted_steps}, 进程数={num_procs_val}, 每进程步数={self.local_steps_per_epoch}")
+        else:
+            print(f"🔧 进程步数分配: 总步数={self.steps_per_epoch}, 进程数={num_procs_val}, 每进程步数={self.local_steps_per_epoch}")
         self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam)
 
         # Set up optimizers for policy and value function
@@ -704,7 +674,7 @@ class PPOAgent:
             torch.cuda.synchronize()
         gpu_train_start = time.time()
         
-        data = self.buf.get(self.use_mpi)
+        data = self.buf.get()
 
         pi_l_old, pi_info_old = self._compute_loss_pi(data)
         pi_l_old = pi_l_old.item()
@@ -714,17 +684,11 @@ class PPOAgent:
         for i in range(self.train_pi_iters):
             self.pi_optimizer.zero_grad()
             loss_pi, pi_info = self._compute_loss_pi(data)
-            if self.use_mpi:
-                from spinup.utils.mpi_tools import mpi_avg
-                kl = mpi_avg(pi_info['kl'])
-            else:
-                kl = pi_info['kl']
+            kl = mpi_avg(pi_info['kl'])
             if kl > 1.5 * self.target_kl:
                 break
             loss_pi.backward()
-            if self.use_mpi:
-                from spinup.utils.mpi_pytorch import mpi_avg_grads
-                mpi_avg_grads(self.ac.pi)    # average grads across MPI processes
+            mpi_avg_grads(self.ac.pi)    # average grads across MPI processes
             self.pi_optimizer.step()
 
         # Value function learning
@@ -732,9 +696,7 @@ class PPOAgent:
             self.vf_optimizer.zero_grad()
             loss_v = self._compute_loss_v(data)
             loss_v.backward()
-            if self.use_mpi:
-                from spinup.utils.mpi_pytorch import mpi_avg_grads
-                mpi_avg_grads(self.ac.v)    # average grads across MPI processes
+            mpi_avg_grads(self.ac.v)    # average grads across MPI processes
             self.vf_optimizer.step()
 
         if self.device.type == 'cuda':
@@ -758,15 +720,9 @@ class PPOAgent:
 
     def _log_epoch_info(self, epoch, start_time):
         """Log epoch information"""
-        # Print epoch info (only for first process or single process mode)
-        if not self.use_mpi:
-            # Single process mode
+        # Print epoch info (only for first process)
+        if proc_id() == 0:
             self._print_epoch_info(epoch, start_time)
-        else:
-            # MPI mode
-            from spinup.utils.mpi_tools import proc_id
-            if proc_id() == 0:
-                self._print_epoch_info(epoch, start_time)
     
     def _print_epoch_info(self, epoch, start_time):
         """Print epoch information"""
@@ -994,7 +950,7 @@ class PPOAgent:
 def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.05, logger_kwargs=dict(), save_freq=100, use_mpi=True, device=None,
+        target_kl=0.05, logger_kwargs=dict(), save_freq=100, device=None,
         min_steps_per_proc=None):
     """
     Proximal Policy Optimization (by clipping) function for backward compatibility
@@ -1003,7 +959,7 @@ def ppo(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
     """
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
-                    lam, max_ep_len, target_kl, logger_kwargs, save_freq, use_mpi, device,
+                    lam, max_ep_len, target_kl, logger_kwargs, save_freq, device,
                     min_steps_per_proc)
     agent.train()
 
@@ -1025,7 +981,6 @@ if __name__ == '__main__':
     parser.add_argument('--train_pi_iters', type=int, default=80, help='策略网络训练迭代次数')
     parser.add_argument('--train_v_iters', type=int, default=80, help='价值网络训练迭代次数')
     parser.add_argument('--target_kl', type=float, default=0.01, help='KL散度目标值（更保守）')
-    parser.add_argument('--no-mpi', action='store_true', help='禁用MPI，使用单进程模式')
     parser.add_argument('--device', type=str, default=None, help='指定设备 (cuda/cpu/auto)')
     
     # CNN网络参数控制
@@ -1042,8 +997,6 @@ if __name__ == '__main__':
                        help='每个进程的最小步数，用于避免轨迹截断')
     args = parser.parse_args()
 
-    # 根据参数决定是否使用MPI
-    use_mpi = not args.no_mpi
     
     # 处理设备参数
     device = args.device
@@ -1053,11 +1006,7 @@ if __name__ == '__main__':
         print("⚠️  CUDA不可用，回退到CPU")
         device = 'cpu'
     
-    if use_mpi:
-        from spinup.utils.mpi_tools import mpi_fork
-        mpi_fork(args.cpu)  # run parallel code with mpi
-    else:
-        print("🚫 禁用MPI模式: 使用单进程训练")
+    mpi_fork(args.cpu)  # run parallel code with mpi
 
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
@@ -1094,5 +1043,5 @@ if __name__ == '__main__':
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
         train_v_iters=args.train_v_iters, target_kl=args.target_kl,
-        logger_kwargs=logger_kwargs, use_mpi=use_mpi, device=device,
+        logger_kwargs=logger_kwargs, device=device,
         min_steps_per_proc=args.min_steps_per_proc)
