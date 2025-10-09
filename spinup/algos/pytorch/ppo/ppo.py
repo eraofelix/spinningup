@@ -1242,6 +1242,10 @@ class PPOAgent:
     
     def _evaluate_and_record_videos(self, epoch, model_path):
         """评估模型并录制视频"""
+        import os
+        import shutil
+        import glob
+        
         print(f"🎬 开始评估模型并录制视频 (Epoch {epoch})")
         
         # 创建视频保存目录
@@ -1269,72 +1273,28 @@ class PPOAgent:
         for episode in range(num_episodes):
             print(f"  录制第 {episode + 1}/{num_episodes} 段视频...")
             
-            # 先运行episode获取返回值和长度
-            episode_return = 0
-            episode_length = 0
-            done = False
+            # 为每个episode创建独立的视频目录，避免RecordVideo冲突
+            episode_video_dir = os.path.join(video_dir, f'episode_{episode + 1}_temp')
+            os.makedirs(episode_video_dir, exist_ok=True)
             
-            # 创建临时环境来获取episode信息
-            temp_env = gym.make(env_name, render_mode='rgb_array')
-            if 'CarRacing' in env_name:
-                temp_env = FrameStack(temp_env, stack_size=4)
-            
+            # 直接在RecordVideo环境上运行，获取真实回报
             try:
-                obs, _ = temp_env.reset()
-                
-                while not done and episode_length < 1000:  # 限制最大步数
-                    with torch.no_grad():
-                        # 处理观测
-                        if len(obs.shape) == 3:  # 单帧图像
-                            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
-                        elif len(obs.shape) == 4:  # FrameStack
-                            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
-                        else:
-                            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
-                        
-                        # 获取确定性动作（预运行阶段）
-                        action = self.ac.act(obs_tensor, deterministic=True)
-                        
-                        # 确保动作形状正确
-                        if len(action.shape) > 1 and action.shape[0] == 1:
-                            action = action[0]
-                    
-                    # 执行动作
-                    obs, reward, terminated, truncated, _ = temp_env.step(action)
-                    done = terminated or truncated
-                    
-                    episode_return += reward
-                    episode_length += 1
-                
-                print(f"    Episode {episode + 1}: Return = {episode_return:.2f}, Length = {episode_length}")
-                
-            except Exception as e:
-                print(f"    Episode {episode + 1} 预运行失败: {e}")
-                episode_return = 0.0
-                episode_length = 0
-            finally:
-                temp_env.close()
-            
-            # 现在用获取到的信息创建视频录制环境
-            try:
-                # 创建包含返回值和长度的文件名
-                video_filename = f'episode_{episode + 1}_return={episode_return:.2f}_length={episode_length}'
-                
+                # 创建视频录制环境（使用独立目录）
                 env_with_video = RecordVideo(
                     eval_env, 
-                    video_folder=video_dir,
+                    video_folder=episode_video_dir,
                     episode_trigger=lambda x: True,  # 每个episode都录制
-                    name_prefix=video_filename,
+                    name_prefix='video',  # 简单名称
                     video_length=1000  # 最大录制长度
                 )
                 
                 # 运行episode并录制
                 obs, _ = env_with_video.reset()
-                episode_return_record = 0
-                episode_length_record = 0
+                episode_return = 0
+                episode_length = 0
                 done = False
                 
-                while not done and episode_length_record < 1000:
+                while not done and episode_length < 1000:
                     with torch.no_grad():
                         # 处理观测
                         if len(obs.shape) == 3:  # 单帧图像
@@ -1344,7 +1304,7 @@ class PPOAgent:
                         else:
                             obs_tensor = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
                         
-                        # 获取确定性动作（录制阶段）
+                        # 获取确定性动作
                         action = self.ac.act(obs_tensor, deterministic=True)
                         
                         # 确保动作形状正确
@@ -1355,11 +1315,56 @@ class PPOAgent:
                     obs, reward, terminated, truncated, _ = env_with_video.step(action)
                     done = terminated or truncated
                     
-                    episode_return_record += reward
-                    episode_length_record += 1
+                    episode_return += reward
+                    episode_length += 1
                 
-                episode_returns.append(episode_return_record)
-                print(f"    视频文件: {video_filename}.mp4")
+                episode_returns.append(episode_return)
+                print(f"    Episode {episode + 1}: Return = {episode_return:.2f}, Length = {episode_length}")
+                
+                # 移动并重命名视频文件为最终名称
+                try:
+                    # 调试：列出临时目录中的所有文件
+                    if os.path.exists(episode_video_dir):
+                        all_files = os.listdir(episode_video_dir)
+                        print(f"    调试: 临时目录 {episode_video_dir} 中的文件: {all_files}")
+                    
+                    # 尝试多种文件模式
+                    patterns = [
+                        os.path.join(episode_video_dir, 'video-episode-*.mp4'),
+                        os.path.join(episode_video_dir, '*.mp4'),
+                        os.path.join(episode_video_dir, 'video-*.mp4')
+                    ]
+                    
+                    video_files = []
+                    for pattern in patterns:
+                        video_files = glob.glob(pattern)
+                        if video_files:
+                            print(f"    调试: 找到文件，模式: {pattern}")
+                            break
+                    
+                    if video_files:
+                        old_path = video_files[0]
+                        final_filename = f'episode_{episode + 1}_return={episode_return:.2f}_length={episode_length}.mp4'
+                        new_path = os.path.join(video_dir, final_filename)
+                        
+                        # 移动文件到主目录并重命名
+                        shutil.move(old_path, new_path)
+                        print(f"    视频文件: {final_filename}")
+                        
+                        # 清理临时目录
+                        try:
+                            os.rmdir(episode_video_dir)
+                        except:
+                            pass  # 忽略清理失败
+                    else:
+                        print(f"    警告: 未找到episode {episode + 1}的视频文件")
+                        print(f"    调试: 临时目录: {episode_video_dir}")
+                        print(f"    调试: 目录存在: {os.path.exists(episode_video_dir)}")
+                        if os.path.exists(episode_video_dir):
+                            print(f"    调试: 目录内容: {os.listdir(episode_video_dir)}")
+                        
+                except Exception as rename_error:
+                    print(f"    移动视频文件失败: {rename_error}")
                 
             except Exception as e:
                 print(f"    Episode {episode + 1} 录制失败: {e}")
