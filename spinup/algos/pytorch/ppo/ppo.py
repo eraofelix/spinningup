@@ -1318,6 +1318,13 @@ class PPOAgent:
                     episode_return += reward
                     episode_length += 1
                 
+                # 重要：关闭环境以触发视频保存
+                env_with_video.close()
+                
+                # 等待视频文件写入完成
+                import time
+                time.sleep(0.5)  # 等待500ms让视频文件写入完成
+                
                 episode_returns.append(episode_return)
                 print(f"    Episode {episode + 1}: Return = {episode_return:.2f}, Length = {episode_length}")
                 
@@ -1371,8 +1378,8 @@ class PPOAgent:
                 episode_returns.append(0.0)
             
             finally:
-                if 'env_with_video' in locals():
-                    env_with_video.close()
+                # env_with_video已经在episode结束后关闭了
+                pass
         
         # 统计结果
         mean_return = np.mean(episode_returns)
