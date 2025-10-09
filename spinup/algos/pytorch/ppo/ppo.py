@@ -22,7 +22,8 @@ import cv2
 from gymnasium.wrappers import RecordVideo
 import shutil
 
-DEFAULT_DATA_DIR = "/root/tf-logs" if osp.exists("/root/tf-logs") else osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
+DEFAULT_TBOARD_DIR = "/root/tf-logs" if osp.exists("/root/tf-logs") else osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
+DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
 FORCE_DATESTAMP = False
 
 def count_vars(module):
@@ -694,12 +695,14 @@ class PPOAgent:
         exp_name = f'ppo_{timestamp}'
         self.output_dir = osp.join(DEFAULT_DATA_DIR, exp_name)
         
-        # Set up TensorBoard writer
-        self.tb_writer = SummaryWriter(log_dir=self.output_dir)
+        # Set up TensorBoard writer (使用单独的TensorBoard目录)
+        self.tb_output_dir = osp.join(DEFAULT_TBOARD_DIR, exp_name)
+        self.tb_writer = SummaryWriter(log_dir=self.tb_output_dir)
         
         # Save configuration to JSON file
         config_path = os.path.join(self.output_dir, 'config.json')
         os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.tb_output_dir, exist_ok=True)
         import json
         
         # 只保存重要的配置参数，避免循环引用
@@ -1243,29 +1246,78 @@ class PPOAgent:
             eval_env = FrameStack(eval_env, stack_size=4)
         
         # 录制5段视频
-        num_episodes = 5
+        num_episodes = 2
         episode_returns = []
         
         for episode in range(num_episodes):
             print(f"  录制第 {episode + 1}/{num_episodes} 段视频...")
             
-            # 创建视频录制环境
-            video_path = os.path.join(video_dir, f'episode_{episode + 1}.mp4')
-            env_with_video = RecordVideo(
-                eval_env, 
-                video_folder=os.path.dirname(video_path),
-                episode_trigger=lambda x: True,  # 每个episode都录制
-                name_prefix=f'episode_{episode + 1}',
-                video_length=1000  # 最大录制长度
-            )
+            # 先运行episode获取返回值和长度
+            episode_return = 0
+            episode_length = 0
+            done = False
+            
+            # 创建临时环境来获取episode信息
+            temp_env = gym.make(env_name, render_mode='rgb_array')
+            if 'CarRacing' in env_name:
+                temp_env = FrameStack(temp_env, stack_size=4)
             
             try:
-                obs, _ = env_with_video.reset()
-                episode_return = 0
-                episode_length = 0
-                done = False
+                obs, _ = temp_env.reset()
                 
                 while not done and episode_length < 1000:  # 限制最大步数
+                    with torch.no_grad():
+                        # 处理观测
+                        if len(obs.shape) == 3:  # 单帧图像
+                            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+                        elif len(obs.shape) == 4:  # FrameStack
+                            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+                        else:
+                            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
+                        
+                        # 获取动作
+                        action = self.ac.act(obs_tensor)
+                        
+                        # 确保动作形状正确
+                        if len(action.shape) > 1 and action.shape[0] == 1:
+                            action = action[0]
+                    
+                    # 执行动作
+                    obs, reward, terminated, truncated, _ = temp_env.step(action)
+                    done = terminated or truncated
+                    
+                    episode_return += reward
+                    episode_length += 1
+                
+                print(f"    Episode {episode + 1}: Return = {episode_return:.2f}, Length = {episode_length}")
+                
+            except Exception as e:
+                print(f"    Episode {episode + 1} 预运行失败: {e}")
+                episode_return = 0.0
+                episode_length = 0
+            finally:
+                temp_env.close()
+            
+            # 现在用获取到的信息创建视频录制环境
+            try:
+                # 创建包含返回值和长度的文件名
+                video_filename = f'episode_{episode + 1}_return={episode_return:.2f}_length={episode_length}'
+                
+                env_with_video = RecordVideo(
+                    eval_env, 
+                    video_folder=video_dir,
+                    episode_trigger=lambda x: True,  # 每个episode都录制
+                    name_prefix=video_filename,
+                    video_length=1000  # 最大录制长度
+                )
+                
+                # 运行episode并录制
+                obs, _ = env_with_video.reset()
+                episode_return_record = 0
+                episode_length_record = 0
+                done = False
+                
+                while not done and episode_length_record < 1000:
                     with torch.no_grad():
                         # 处理观测
                         if len(obs.shape) == 3:  # 单帧图像
@@ -1286,18 +1338,19 @@ class PPOAgent:
                     obs, reward, terminated, truncated, _ = env_with_video.step(action)
                     done = terminated or truncated
                     
-                    episode_return += reward
-                    episode_length += 1
+                    episode_return_record += reward
+                    episode_length_record += 1
                 
-                episode_returns.append(episode_return)
-                print(f"    Episode {episode + 1}: Return = {episode_return:.2f}, Length = {episode_length}")
+                episode_returns.append(episode_return_record)
+                print(f"    视频文件: {video_filename}.mp4")
                 
             except Exception as e:
                 print(f"    Episode {episode + 1} 录制失败: {e}")
                 episode_returns.append(0.0)
             
             finally:
-                env_with_video.close()
+                if 'env_with_video' in locals():
+                    env_with_video.close()
         
         # 统计结果
         mean_return = np.mean(episode_returns)
