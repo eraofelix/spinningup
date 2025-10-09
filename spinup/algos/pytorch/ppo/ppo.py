@@ -495,10 +495,10 @@ def make_env():
     env = OffRoadEarlyTerminate(env,           # 再加离路提前结束
                                 offroad_penalty=-5.0,
                                 end_on_offroad=True,
-                                min_steps_before_check=100,       # 增加起步检测延迟
-                                # 优化检测参数
-                                region_rel=(0.7, 0.9, 0.3, 0.7),  # 检测车辆前方更小区域
-                                offroad_ratio_thresh=0.5,          # 提高阈值，减少误判
+                                min_steps_before_check=50,        # 减少起步检测延迟
+                                # 优化检测参数 - 更宽松的设置
+                                region_rel=(0.6, 0.9, 0.2, 0.8),  # 检测更大区域
+                                offroad_ratio_thresh=0.7,          # 提高阈值，减少误判
                                 green_threshold=(50, 100, 50))     # 调整绿色检测阈值
     return env
 
@@ -846,6 +846,13 @@ class PPOAgent:
             'gpu_times': [],  # GPU计算时间
             'cpu_times': []   # CPU环境交互时间
         }
+        
+        # 打印关键参数信息
+        if proc_id() == 0:
+            print(f"🔧 训练参数:")
+            print(f"   max_ep_len: {self.max_ep_len}")
+            print(f"   steps_per_epoch: {self.steps_per_epoch}")
+            print(f"   steps_per_epoch: {self.steps_per_epoch}")
 
         # Random seed
         seed = self.seed + 10000 * proc_id()
@@ -890,7 +897,7 @@ class PPOAgent:
             var_counts = tuple(count_vars(module) for module in [self.ac.pi, self.ac.v])
             print(f'\nNumber of parameters: pi: {var_counts[0]}, v: {var_counts[1]}')
             print("=" * 180)
-            print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | ClipFrac  | Early Stop | GPU Time | CPU Time | GPU Memory")
+            print("Epoch    | Return    | Policy Loss | Value Loss | KL        | Entropy  | ClipFrac  | Avg Length | Early Stop | GPU Time | CPU Time | GPU Memory")
             print("=" * 180)
 
     def _setup_training_components(self):
@@ -1103,6 +1110,8 @@ class PPOAgent:
         kl_div = np.mean(self.epoch_metrics['kl']) if self.epoch_metrics['kl'] else 0.0
         entropy = np.mean(self.epoch_metrics['entropy']) if self.epoch_metrics['entropy'] else 0.0
         clip_frac = np.mean(self.epoch_metrics['clip_frac']) if self.epoch_metrics['clip_frac'] else 0.0
+        avg_length = np.mean(self.epoch_metrics['ep_lengths']) if self.epoch_metrics['ep_lengths'] else 0.0
+        print(f"ep_lengths: {self.epoch_metrics['ep_lengths']}, avg_length: {avg_length}")
         early_stop = np.mean(self.epoch_metrics['stop_iter']) if self.epoch_metrics['stop_iter'] else 0.0
         early_stop_flag = "True" if early_stop < self.train_pi_iters - 1 else "False"
         
@@ -1113,7 +1122,7 @@ class PPOAgent:
         time_info = f" | GPU: {gpu_time:.2f}s({gpu_ratio:.1f}%)"
         
         # 单行打印，严格对齐（Return使用原始奖励，与评估一致）
-        print(f"Epoch {epoch:4d} | Return: {ep_return:5.2f} | Policy Loss: {policy_loss:5.4f} | Value Loss: {value_loss:5.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:5.4f} | ClipFrac: {clip_frac:5.4f} | Early Stop: {early_stop_flag:5s}{time_info}")
+        print(f"Epoch {epoch:4d} | Return: {ep_return:5.2f} | Policy Loss: {policy_loss:5.4f} | Value Loss: {value_loss:5.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:5.4f} | ClipFrac: {clip_frac:5.4f} | Avg Length: {avg_length:6.1f} | Early Stop: {early_stop_flag:5s}{time_info}")
         
         # 记录到 TensorBoard - 基本训练指标
         self.tb_writer.add_scalar('Training/Epoch', epoch, epoch)
@@ -1265,6 +1274,8 @@ class PPOAgent:
                 timeout = ep_len == self.max_ep_len  # 达到最大步数限制
                 terminal = d or timeout  # 轨迹结束: 自然终止 OR 超时终止
                 epoch_ended = t==self.local_steps_per_epoch-1  # 当前epoch结束
+                if proc_id() == 0 and epoch < num_debug_epochs:
+                    print(f"🔍 Episode {len(self.epoch_metrics['ep_returns'])+1} ep_len {ep_len} max_ep_len {self.max_ep_len} timeout {timeout} terminal {terminal} epoch_ended {epoch_ended}")
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} timeout {timeout} terminal {terminal} epoch_ended {epoch_ended}")
 
@@ -1288,14 +1299,14 @@ class PPOAgent:
                         # 逻辑: (terminated=True) AND (truncated=False) AND (timeout=False) AND (epoch_ended=False)
                         # 说明: 任务真正结束(如智能体死亡、到达目标)，没有未来奖励
                         v = 0  # 自然终止时价值为0
-                        print("自然终止")
+                        # print("自然终止")
                     self.buf.finish_path(v)  # (obs, act, rew, val, logp) -> (obs, act, ret, adv, logp, adv, ret)
                     if epoch < num_debug_epochs and t < num_debug_steps:
                         print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} finish_path")
-                    # if terminal:
-                        # 记录到 TensorBoard 指标中
-                    self.epoch_metrics['ep_returns'].append(ep_ret)  # 使用原始奖励
-                    self.epoch_metrics['ep_lengths'].append(ep_len)
+                    if terminal:
+                        # 只有自然终止时才记录，其他情况不记录
+                        self.epoch_metrics['ep_returns'].append(ep_ret)  # 使用原始奖励
+                        self.epoch_metrics['ep_lengths'].append(ep_len)
                     o, _ = self.env.reset()
                     if epoch < num_debug_epochs and t < num_debug_steps:
                         print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} reset")
@@ -1349,9 +1360,8 @@ class PPOAgent:
         eval_env = OffRoadEarlyTerminate(base_env,           # 再加离路提前结束
                                         offroad_penalty=-5.0,
                                         end_on_offroad=True,
-                                        min_steps_before_check=50,       # 增加起步检测延迟
-                                        # 优化检测参数
-                                        region_rel=(0.7, 0.9, 0.3, 0.7),  # 检测车辆前方更小区域
+                                        min_steps_before_check=50,        # 减少起步检测延迟
+                                        region_rel=(0.6, 0.9, 0.2, 0.8),  # 检测更大区域
                                         offroad_ratio_thresh=0.7,          # 提高阈值，减少误判
                                         green_threshold=(50, 100, 50))     # 调整绿色检测阈值
         
@@ -1496,7 +1506,7 @@ class PPOAgent:
 
 def ppo(env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.15, pi_lr=3e-4,
-        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=100,
+        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
         target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None, record_videos=False):
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
@@ -1514,7 +1524,7 @@ if __name__ == '__main__':
     parser.add_argument('--vf_lr', type=float, default=1e-3, help='价值网络学习率')
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--cpu', type=int, default=4)
-    parser.add_argument('--steps', type=int, default=4000)
+    parser.add_argument('--steps_per_epoch', type=int, default=4000)
     parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--exp_name', type=str, default='ppo')
     parser.add_argument('--train_pi_iters', type=int, default=80, help='策略网络训练迭代次数')
@@ -1531,6 +1541,7 @@ if __name__ == '__main__':
     parser.add_argument('--record_videos', action='store_true', 
                        help='是否在保存checkpoint时录制视频')
     parser.add_argument('--save_freq', type=int, default=100, help='保存模型的频率')
+    parser.add_argument('--max_ep_len', type=int, default=1000, help='每个episode的最大步数')
     args = parser.parse_args()
 
     
@@ -1567,10 +1578,10 @@ if __name__ == '__main__':
 
     ppo(lambda : make_env(), actor_critic=actor_critic,
         ac_kwargs=ac_kwargs, gamma=args.gamma, 
-        seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
+        seed=args.seed, steps_per_epoch=args.steps_per_epoch, epochs=args.epochs,
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
         train_v_iters=args.train_v_iters, target_kl=args.target_kl,
-        device=device,
+        max_ep_len=args.max_ep_len, device=device,
         min_steps_per_proc=args.min_steps_per_proc,
         save_freq=args.save_freq,
         record_videos=args.record_videos)
