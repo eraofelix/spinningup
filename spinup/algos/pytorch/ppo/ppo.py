@@ -948,14 +948,14 @@ class PPOAgent:
             
             # 上调条件：连续3个epoch mean_KL < 0.5×target_kl 且 clip_frac > 0.6
             if (recent_kl < 0.5 * self.target_kl) and (recent_cf > 0.6):
-                new_lr = min(self.pi_lr * 1.5, 2e-4)
+                new_lr = min(self.pi_lr * 1.05, 1e-4)
                 
                 if proc_id() == 0:
                     print(f"📈 提升pi_lr: KL={recent_kl:.4f} < {0.5 * self.target_kl:.4f}, CF={recent_cf:.4f} > 0.6")
                     print(f"   pi_lr: {self.pi_lr:.2e} -> {new_lr:.2e}")
             # 下调条件：KL过大或CF过小
             elif (recent_kl > 2.0 * self.target_kl) or (recent_cf < 0.1):
-                new_lr = max(self.pi_lr * 0.5, 1e-5)
+                new_lr = max(self.pi_lr * 0.95, 1e-5)
                 
                 if proc_id() == 0:
                     print(f"📉 降低pi_lr: KL={recent_kl:.4f}, CF={recent_cf:.4f}")
