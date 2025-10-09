@@ -10,15 +10,15 @@ import os
 import argparse
 import sys
 sys.path.append('spinup')
-from spinup.algos.pytorch.ppo.ppo import MLPActorCritic
-from spinup.algos.pytorch.ppo.cnn_attention import CNNActorCritic
+from spinup.algos.pytorch.ppo.ppo import CNNActorCriticShared
+from gymnasium.wrappers import FrameStackObservation as FrameStack
 
 def detect_model_architecture(model_path):
     """自动检测模型架构（支持MLP和CNN）"""
     checkpoint = torch.load(model_path, map_location='cpu')
     
-    # 检查是否是CNN模型
-    has_cnn_layers = any('cnn_extractor' in key for key in checkpoint.keys())
+    # 检查是否是CNN模型 - 检查encoder层
+    has_cnn_layers = any('encoder' in key for key in checkpoint.keys())
     
     if has_cnn_layers:
         print("🖼️  检测到CNN模型")
@@ -29,31 +29,23 @@ def detect_model_architecture(model_path):
 
 def detect_cnn_architecture(checkpoint):
     """检测CNN模型架构"""
-    # 分析CNN特征提取器
-    cnn_weights = {k: v for k, v in checkpoint.items() if 'cnn_extractor' in k}
+    print("🔍 分析模型权重...")
     
-    # 检测卷积层通道数
-    conv_channels = []
-    for key in sorted(cnn_weights.keys()):
-        if 'conv_layers' in key and 'weight' in key:
-            # 提取层号
-            parts = key.split('.')
-            for i, part in enumerate(parts):
-                if part == 'conv_layers' and i + 1 < len(parts):
-                    layer_idx = int(parts[i + 1])
-                    if layer_idx % 3 == 0:  # 每3层是一个卷积层（Conv2d, BatchNorm, ReLU）
-                        conv_idx = layer_idx // 3
-                        if conv_idx < 4:  # 只取前4个卷积层
-                            weight_shape = cnn_weights[key].shape
-                            if len(weight_shape) == 4:  # Conv2d权重
-                                out_channels = weight_shape[0]
-                                conv_channels.append(out_channels)
+    # 检测特征维度 - 从encoder.head层
+    feature_dim = 256  # 默认值
+    for key, weight in checkpoint.items():
+        if 'encoder.head' in key and 'weight' in key:
+            weight_shape = weight.shape
+            if len(weight_shape) == 2:  # 线性层权重
+                feature_dim = weight_shape[1]  # 输入维度
+                print(f"  检测到特征维度: {feature_dim}")
+                break
     
-    # 检测全连接层
-    fc_weights = {k: v for k, v in checkpoint.items() if 'policy_net' in k and 'weight' in key}
+    # 检测策略网络隐藏层 - 从pi.mlp层
+    pi_weights = {k: v for k, v in checkpoint.items() if 'pi.mlp' in k and 'weight' in key}
     hidden_sizes = []
-    for key in sorted(fc_weights.keys()):
-        weight_shape = fc_weights[key].shape
+    for key in sorted(pi_weights.keys()):
+        weight_shape = pi_weights[key].shape
         if len(weight_shape) == 2:  # 线性层权重
             hidden_sizes.append(weight_shape[0])
     
@@ -61,14 +53,33 @@ def detect_cnn_architecture(checkpoint):
     if len(hidden_sizes) > 1:
         hidden_sizes = hidden_sizes[:-1]
     
-    print(f"CNN卷积层通道数: {conv_channels[:4]}")
-    print(f"CNN全连接层大小: {hidden_sizes}")
+    print(f"  策略网络隐藏层: {hidden_sizes}")
+    
+    # 检测价值网络隐藏层
+    v_weights = {k: v for k, v in checkpoint.items() if 'v.v' in k and 'weight' in key}
+    critic_hidden = []
+    for key in sorted(v_weights.keys()):
+        weight_shape = v_weights[key].shape
+        if len(weight_shape) == 2:  # 线性层权重
+            critic_hidden.append(weight_shape[0])
+    
+    # 移除最后一层（输出层）
+    if len(critic_hidden) > 1:
+        critic_hidden = critic_hidden[:-1]
+    
+    print(f"  价值网络隐藏层: {critic_hidden}")
+    
+    # 根据实际检测到的架构调整参数
+    if not hidden_sizes:
+        hidden_sizes = [256, 128]  # 默认值
+    if not critic_hidden:
+        critic_hidden = [256, 128]  # 默认值
     
     return {
         'type': 'cnn',
-        'cnn_channels': conv_channels[:4] if len(conv_channels) >= 4 else [16, 32, 64, 128],
-        'hidden_sizes': hidden_sizes if hidden_sizes else [128, 64],
-        'feature_dim': hidden_sizes[0] if hidden_sizes else 256
+        'feature_dim': feature_dim,
+        'actor_hidden': hidden_sizes if hidden_sizes else [256, 128],
+        'critic_hidden': critic_hidden if critic_hidden else [256, 128]
     }
 
 def detect_mlp_architecture(checkpoint):
@@ -106,33 +117,48 @@ def detect_mlp_architecture(checkpoint):
 
 def load_model(model_path, env, architecture_info=None):
     """加载训练好的模型（支持MLP和CNN）"""
-    # 如果没有指定架构，自动检测
-    if architecture_info is None:
-        architecture_info = detect_model_architecture(model_path)
-    
-    # 根据模型类型创建网络结构
-    if architecture_info['type'] == 'cnn':
-        print("🖼️  创建CNN网络...")
-        ac = CNNActorCritic(
+    # 对于CarRacing环境，直接使用默认的CNN架构
+    if 'CarRacing' in str(env.spec.id) if hasattr(env, 'spec') and env.spec else 'CarRacing' in str(type(env)):
+        print("🖼️  创建CNN网络（CarRacing默认架构）...")
+        ac = CNNActorCriticShared(
             env.observation_space, 
             env.action_space,
-            feature_dim=architecture_info.get('feature_dim', 256),
-            hidden_sizes=architecture_info.get('hidden_sizes', [128, 64]),
-            cnn_channels=architecture_info.get('cnn_channels', [16, 32, 64, 128]),
-            attention_reduction=8,
-            dropout_rate=0.1
+            feature_dim=256,  # 使用默认值
+            actor_hidden=[256, 128],  # 使用默认值
+            critic_hidden=[256, 128],  # 使用默认值
+            car_racing_mode=True,
+            use_framestack=True
         )
+        
+        # 尝试加载模型权重
+        try:
+            checkpoint = torch.load(model_path, map_location='cpu')
+            ac.load_state_dict(checkpoint)
+            print("✅ 模型权重加载成功")
+        except RuntimeError as e:
+            print(f"❌ 模型权重加载失败: {e}")
+            print("💡 尝试使用兼容的架构...")
+            
+            # 如果加载失败，尝试使用检测到的架构
+            if architecture_info is None:
+                architecture_info = detect_model_architecture(model_path)
+            
+            ac = CNNActorCriticShared(
+                env.observation_space, 
+                env.action_space,
+                feature_dim=architecture_info.get('feature_dim', 256),
+                actor_hidden=architecture_info.get('actor_hidden', [256, 128]),
+                critic_hidden=architecture_info.get('critic_hidden', [256, 128]),
+                car_racing_mode=True,
+                use_framestack=True
+            )
+            
+            checkpoint = torch.load(model_path, map_location='cpu')
+            ac.load_state_dict(checkpoint)
     else:
         print("📊 创建MLP网络...")
-        ac = MLPActorCritic(
-            env.observation_space, 
-            env.action_space, 
-            hidden_sizes=architecture_info.get('hidden_sizes', [64, 64])
-        )
-    
-    # 加载模型权重
-    checkpoint = torch.load(model_path, map_location='cpu')
-    ac.load_state_dict(checkpoint)
+        # 暂时不支持MLP，因为当前代码只支持CNN
+        raise NotImplementedError("当前测试脚本只支持CNN模型")
     
     return ac
 
@@ -140,6 +166,16 @@ def test_model(env_name, model_path, num_episodes=5, render=True, architecture_i
     """测试模型性能（支持MLP和CNN）"""
     # 创建环境
     env = gym.make(env_name, render_mode='human' if render else None)
+    
+    # 为CarRacing环境添加FrameStack（如果使用CNN模型）
+    if 'CarRacing' in env_name and architecture_info is None:
+        # 自动检测模型类型
+        temp_checkpoint = torch.load(model_path, map_location='cpu')
+        has_cnn_layers = any('encoder' in key for key in temp_checkpoint.keys())
+        if has_cnn_layers:
+            print("🏎️  检测到CarRacing环境，添加FrameStack(4)包装器")
+            env = FrameStack(env, stack_size=4)
+            print(f"📊 FrameStack后观测空间: {env.observation_space}")
     
     # 加载模型（自动检测架构）
     ac = load_model(model_path, env, architecture_info=architecture_info)
@@ -163,6 +199,12 @@ def test_model(env_name, model_path, num_episodes=5, render=True, architecture_i
             with torch.no_grad():
                 # 处理图像观测
                 if len(obs.shape) == 3:  # 图像观测 (H, W, C)
+                    obs_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+                    action = ac.act(obs_tensor)
+                    # 确保动作是正确的形状：从 (1, 3) 转换为 (3,)
+                    if len(action.shape) > 1 and action.shape[0] == 1:
+                        action = action[0]  # 取第一个（也是唯一的）动作
+                elif len(obs.shape) == 4:  # FrameStack观测 (S, H, W, C)
                     obs_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
                     action = ac.act(obs_tensor)
                     # 确保动作是正确的形状：从 (1, 3) 转换为 (3,)
@@ -220,9 +262,8 @@ if __name__ == "__main__":
     parser.add_argument('--experiment_dir', type=str, help='实验目录（自动找最新模型）')
     parser.add_argument('--episodes', type=int, default=5, help='测试回合数')
     parser.add_argument('--no_render', action='store_true', help='不显示渲染')
-    # CNN网络参数（可选，自动检测）
+    # 网络参数（可选，自动检测）
     parser.add_argument('--feature_dim', type=int, help='CNN特征维度（可选，自动检测）')
-    parser.add_argument('--cnn_channels', type=int, nargs=4, help='CNN各层通道数（可选，自动检测）')
     parser.add_argument('--hidden_sizes', type=int, nargs='+', help='全连接层隐藏层大小（可选，自动检测）')
     
     # MLP网络参数（向后兼容）
@@ -252,29 +293,29 @@ if __name__ == "__main__":
     
     # 创建架构信息（如果指定了参数）
     architecture_info = None
-    if any([args.feature_dim, args.cnn_channels, args.hidden_sizes, args.hid, args.l]):
+    if any([args.feature_dim, args.hidden_sizes, args.hid, args.l]):
         print("使用指定的模型架构参数...")
         architecture_info = {}
         
         # 判断是CNN还是MLP参数
-        if any([args.feature_dim, args.cnn_channels]):
+        if args.feature_dim or 'CarRacing' in args.env:
             # CNN参数
             architecture_info['type'] = 'cnn'
             if args.feature_dim:
                 architecture_info['feature_dim'] = args.feature_dim
-            if args.cnn_channels:
-                architecture_info['cnn_channels'] = args.cnn_channels
             if args.hidden_sizes:
-                architecture_info['hidden_sizes'] = args.hidden_sizes
+                architecture_info['actor_hidden'] = args.hidden_sizes
+                architecture_info['critic_hidden'] = args.hidden_sizes
         elif args.hid and args.l:
             # MLP参数（向后兼容）
             architecture_info['type'] = 'mlp'
             architecture_info['hidden_sizes'] = [args.hid] * args.l
         elif args.hidden_sizes:
             # 只有hidden_sizes，需要判断环境类型
-            if args.env == 'CarRacing-v3':
+            if 'CarRacing' in args.env:
                 architecture_info['type'] = 'cnn'
-                architecture_info['hidden_sizes'] = args.hidden_sizes
+                architecture_info['actor_hidden'] = args.hidden_sizes
+                architecture_info['critic_hidden'] = args.hidden_sizes
             else:
                 architecture_info['type'] = 'mlp'
                 architecture_info['hidden_sizes'] = args.hidden_sizes
