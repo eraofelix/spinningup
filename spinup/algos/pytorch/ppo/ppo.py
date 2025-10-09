@@ -17,6 +17,10 @@ from torch.distributions.normal import Normal
 from torch.distributions.categorical import Categorical
 import torch.nn.functional as F
 from gymnasium.wrappers import FrameStackObservation as FrameStack
+# 视频录制相关导入
+import cv2
+from gymnasium.wrappers import RecordVideo
+import shutil
 
 DEFAULT_DATA_DIR = "/root/tf-logs" if osp.exists("/root/tf-logs") else osp.join(osp.abspath(osp.dirname(osp.dirname(osp.dirname(__file__)))),'../../data')
 FORCE_DATESTAMP = False
@@ -625,7 +629,7 @@ class PPOAgent:
     def __init__(self, env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.15, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-                 target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
+                 target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None, record_videos=False):
 
         # Store parameters
         self.env_fn = env_fn
@@ -645,6 +649,7 @@ class PPOAgent:
         self.target_kl = target_kl
         self.save_freq = save_freq
         self.min_steps_per_proc = min_steps_per_proc
+        self.record_videos = record_videos
         
         # Setup device (GPU/CPU)
         if device is None:
@@ -669,11 +674,8 @@ class PPOAgent:
         
         # Initialize components
         self._setup_environment()
-        print("🔧 _setup_environment done")
         self._setup_agent()
-        print("🔧 _setup_agent done")
         self._setup_training_components()
-        print("🔧 _setup_training_components done")
     
     def _setup_environment(self):
         """Setup environment and related components"""
@@ -846,6 +848,10 @@ class PPOAgent:
         """Save model at specified epoch"""
         model_path = os.path.join(self.output_dir, f'model_epoch_{epoch}.pth')
         torch.save(self.ac.state_dict(), model_path)
+        
+        # 只在进程0且启用视频录制时进行推理评测和视频录制
+        if proc_id() == 0 and self.record_videos:
+            self._evaluate_and_record_videos(epoch, model_path)
 
     def _iterate_minibatches(self, data_dict, batch_size, shuffle=True):
         """
@@ -1213,14 +1219,113 @@ class PPOAgent:
         
         # Close TensorBoard writer
         self.tb_writer.close()
+    
+    def _evaluate_and_record_videos(self, epoch, model_path):
+        """评估模型并录制视频"""
+        print(f"🎬 开始评估模型并录制视频 (Epoch {epoch})")
+        
+        # 创建视频保存目录
+        video_dir = os.path.join(os.path.dirname(model_path), f'videos_epoch_{epoch}')
+        os.makedirs(video_dir, exist_ok=True)
+        
+        # 创建评估环境，指定render_mode
+        import gymnasium as gym
+        # 从训练环境获取环境名称
+        if hasattr(self.env, 'spec') and self.env.spec:
+            env_name = self.env.spec.id
+        else:
+            env_name = 'CarRacing-v2'  # 默认环境
+        
+        eval_env = gym.make(env_name, render_mode='rgb_array')
+        
+        # 为CarRacing环境添加FrameStack
+        if 'CarRacing' in env_name:
+            eval_env = FrameStack(eval_env, stack_size=4)
+        
+        # 录制5段视频
+        num_episodes = 5
+        episode_returns = []
+        
+        for episode in range(num_episodes):
+            print(f"  录制第 {episode + 1}/{num_episodes} 段视频...")
+            
+            # 创建视频录制环境
+            video_path = os.path.join(video_dir, f'episode_{episode + 1}.mp4')
+            env_with_video = RecordVideo(
+                eval_env, 
+                video_folder=os.path.dirname(video_path),
+                episode_trigger=lambda x: True,  # 每个episode都录制
+                name_prefix=f'episode_{episode + 1}',
+                video_length=1000  # 最大录制长度
+            )
+            
+            try:
+                obs, _ = env_with_video.reset()
+                episode_return = 0
+                episode_length = 0
+                done = False
+                
+                while not done and episode_length < 1000:  # 限制最大步数
+                    with torch.no_grad():
+                        # 处理观测
+                        if len(obs.shape) == 3:  # 单帧图像
+                            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+                        elif len(obs.shape) == 4:  # FrameStack
+                            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+                        else:
+                            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
+                        
+                        # 获取动作
+                        action = self.ac.act(obs_tensor)
+                        
+                        # 确保动作形状正确
+                        if len(action.shape) > 1 and action.shape[0] == 1:
+                            action = action[0]
+                    
+                    # 执行动作
+                    obs, reward, terminated, truncated, _ = env_with_video.step(action)
+                    done = terminated or truncated
+                    
+                    episode_return += reward
+                    episode_length += 1
+                
+                episode_returns.append(episode_return)
+                print(f"    Episode {episode + 1}: Return = {episode_return:.2f}, Length = {episode_length}")
+                
+            except Exception as e:
+                print(f"    Episode {episode + 1} 录制失败: {e}")
+                episode_returns.append(0.0)
+            
+            finally:
+                env_with_video.close()
+        
+        # 统计结果
+        mean_return = np.mean(episode_returns)
+        std_return = np.std(episode_returns)
+        max_return = np.max(episode_returns)
+        min_return = np.min(episode_returns)
+        
+        print(f"📊 评估结果 (Epoch {epoch}):")
+        print(f"  平均奖励: {mean_return:.2f} ± {std_return:.2f}")
+        print(f"  最高奖励: {max_return:.2f}")
+        print(f"  最低奖励: {min_return:.2f}")
+        print(f"  视频保存目录: {video_dir}")
+        
+        # 记录到TensorBoard
+        self.tb_writer.add_scalar('Evaluation/Mean_Return', mean_return, epoch)
+        self.tb_writer.add_scalar('Evaluation/Std_Return', std_return, epoch)
+        self.tb_writer.add_scalar('Evaluation/Max_Return', max_return, epoch)
+        self.tb_writer.add_scalar('Evaluation/Min_Return', min_return, epoch)
+        
+        eval_env.close()
 
 def ppo(env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.15, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=100,
-        target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None):
+        target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None, record_videos=False):
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
-                    lam, max_ep_len, target_kl, save_freq, device, min_steps_per_proc)
+                    lam, max_ep_len, target_kl, save_freq, device, min_steps_per_proc, record_videos)
     agent.train()
 
 if __name__ == '__main__':
@@ -1248,6 +1353,9 @@ if __name__ == '__main__':
                        help='全连接层隐藏层大小')
     parser.add_argument('--min_steps_per_proc', type=int, default=None,
                        help='每个进程的最小步数，用于避免轨迹截断')
+    parser.add_argument('--record_videos', action='store_true', 
+                       help='是否在保存checkpoint时录制视频')
+    parser.add_argument('--save_freq', type=int, default=100, help='保存模型的频率')
     args = parser.parse_args()
 
     
@@ -1288,4 +1396,6 @@ if __name__ == '__main__':
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
         train_v_iters=args.train_v_iters, target_kl=args.target_kl,
         device=device,
-        min_steps_per_proc=args.min_steps_per_proc)
+        min_steps_per_proc=args.min_steps_per_proc,
+        save_freq=args.save_freq,
+        record_videos=args.record_videos)

@@ -26,8 +26,10 @@ setup(
         'tensorboard',
         'swig',
         'tensorboard',
-        'scipy'
+        'scipy',
+        'opencv-python'
         # 'gymnasium[box2d]'  需要最后单独安装
+        # 'gymnasium[other]'  需要最后单独安装
     ],
     description="Teaching tools for introducing people to deep RL.",
     author="Joshua Achiam",
