@@ -1138,7 +1138,6 @@ class PPOAgent:
                 prev_action = action_for_env.copy()
                 
                 d = terminated or truncated  # 环境终止: 自然终止 OR 截断终止
-                ep_ret += r
                 ep_len += 1
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} ep_ret {ep_ret} ep_len {ep_len}")
