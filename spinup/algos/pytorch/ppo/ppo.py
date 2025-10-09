@@ -1111,7 +1111,6 @@ class PPOAgent:
         entropy = np.mean(self.epoch_metrics['entropy']) if self.epoch_metrics['entropy'] else 0.0
         clip_frac = np.mean(self.epoch_metrics['clip_frac']) if self.epoch_metrics['clip_frac'] else 0.0
         avg_length = np.mean(self.epoch_metrics['ep_lengths']) if self.epoch_metrics['ep_lengths'] else 0.0
-        print(f"ep_lengths: {self.epoch_metrics['ep_lengths']}, avg_length: {avg_length}")
         early_stop = np.mean(self.epoch_metrics['stop_iter']) if self.epoch_metrics['stop_iter'] else 0.0
         early_stop_flag = "True" if early_stop < self.train_pi_iters - 1 else "False"
         
