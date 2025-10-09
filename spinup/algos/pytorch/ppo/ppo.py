@@ -176,7 +176,7 @@ class ActorHead(nn.Module):
     """
     Gaussian policy head with Tanh squashing to [-1,1].
     """
-    def __init__(self, feature_dim, act_dim, hidden_sizes=(256,128), init_log_std=-1.0):
+    def __init__(self, feature_dim, act_dim, hidden_sizes=(256,128), init_log_std=0.3):
         super().__init__()
         mlp = []
         in_dim = feature_dim
@@ -190,7 +190,7 @@ class ActorHead(nn.Module):
     def forward(self, feats):
         h = self.mlp(feats)
         mu = self.mu_layer(h)
-        log_std = self.log_std.clamp(-4, 1)
+        log_std = self.log_std.clamp(-2, 2)
         return mu, log_std
 
 class CriticHead(nn.Module):
@@ -492,14 +492,14 @@ class OffRoadEarlyTerminate(gym.Wrapper):
 
 def make_env():
     env = gym.make('CarRacing-v3')             # 先创建原环境
-    env = OffRoadEarlyTerminate(env,           # 再加离路提前结束
-                                offroad_penalty=-5.0,
-                                end_on_offroad=True,
-                                min_steps_before_check=50,        # 减少起步检测延迟
-                                # 优化检测参数 - 更宽松的设置
-                                region_rel=(0.6, 0.9, 0.2, 0.8),  # 检测更大区域
-                                offroad_ratio_thresh=0.7,          # 提高阈值，减少误判
-                                green_threshold=(50, 100, 50))     # 调整绿色检测阈值
+    # env = OffRoadEarlyTerminate(env,           # 再加离路提前结束
+    #                             offroad_penalty=-5.0,
+    #                             end_on_offroad=True,
+    #                             min_steps_before_check=50,        # 减少起步检测延迟
+    #                             # 优化检测参数 - 更宽松的设置
+    #                             region_rel=(0.6, 0.9, 0.2, 0.8),  # 检测更大区域
+    #                             offroad_ratio_thresh=0.7,          # 提高阈值，减少误判
+    #                             green_threshold=(50, 100, 50))     # 调整绿色检测阈值
     return env
 
 
@@ -994,7 +994,6 @@ class PPOAgent:
         # 准备数据
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
-        gpu_train_start = time.time()
 
         data = self.buf.get()
         # 预先把数据放到设备上，便于切小批时直接索引
@@ -1048,8 +1047,6 @@ class PPOAgent:
 
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
-        gpu_train_time = time.time() - gpu_train_start
-        self.epoch_metrics['gpu_times'].append(self.epoch_metrics['gpu_times'][-1] + gpu_train_time)
 
         # 记录本 epoch 的 KL/CF
         mean_kl = float(np.mean(kl_list_epoch)) if kl_list_epoch else 0.0
@@ -1356,16 +1353,16 @@ class PPOAgent:
         import gymnasium as gym
         # 重新创建环境，直接指定render_mode
         base_env = gym.make('CarRacing-v3', render_mode='rgb_array')
-        eval_env = OffRoadEarlyTerminate(base_env,           # 再加离路提前结束
-                                        offroad_penalty=-5.0,
-                                        end_on_offroad=True,
-                                        min_steps_before_check=50,        # 减少起步检测延迟
-                                        region_rel=(0.6, 0.9, 0.2, 0.8),  # 检测更大区域
-                                        offroad_ratio_thresh=0.7,          # 提高阈值，减少误判
-                                        green_threshold=(50, 100, 50))     # 调整绿色检测阈值
+        # eval_env = OffRoadEarlyTerminate(base_env,           # 再加离路提前结束
+        #                                 offroad_penalty=-5.0,
+        #                                 end_on_offroad=True,
+        #                                 min_steps_before_check=50,        # 减少起步检测延迟
+        #                                 region_rel=(0.6, 0.9, 0.2, 0.8),  # 检测更大区域
+        #                                 offroad_ratio_thresh=0.7,          # 提高阈值，减少误判
+        #                                 green_threshold=(50, 100, 50))     # 调整绿色检测阈值
         
         # 为CarRacing环境添加FrameStack
-        eval_env = FrameStack(eval_env, stack_size=4)
+        eval_env = FrameStack(base_env, stack_size=4)
         
         # 录制5段视频
         num_episodes = 2
@@ -1405,8 +1402,10 @@ class PPOAgent:
                         else:
                             obs_tensor = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
                         
-                        # 获取确定性动作
-                        action = self.ac.act(obs_tensor, deterministic=True)
+                        # 获取确定性动作 - 使用与训练一致的动作映射逻辑
+                        a_tanh, _, _ = self.ac.step(obs_tensor, return_env_action=False, deterministic=True)
+                        a_tanh_tensor = torch.as_tensor(a_tanh, dtype=torch.float32)
+                        action = self.ac._map_to_carracing(a_tanh_tensor).cpu().numpy()
                         
                         # 确保动作形状正确
                         if len(action.shape) > 1 and action.shape[0] == 1:
@@ -1506,7 +1505,7 @@ class PPOAgent:
 def ppo(env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.15, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None, record_videos=False):
+        target_kl=0.1, save_freq=100, device=None, min_steps_per_proc=None, record_videos=False):
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
                     lam, max_ep_len, target_kl, save_freq, device, min_steps_per_proc, record_videos)
