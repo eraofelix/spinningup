@@ -413,6 +413,96 @@ class CNNActorCriticShared(nn.Module):
             from torch.distributions import Categorical
             return Categorical(logits=mu)
 
+
+class OffRoadEarlyTerminate(gym.Wrapper):
+    def __init__(
+        self,
+        env,
+        green_threshold=(60, 120, 60),   # 绿色像素阈值 (R<G_th[1], G>G_th[1], B<G_th[1]) 简易版本
+        region_rel=(0.55, 0.75, 0.35, 0.65),  # 检测区域在图像中的相对坐标 (y1,y2,x1,x2)
+        offroad_ratio_thresh=0.60,      # 区域内绿色像素比例超过此阈值判定离路
+        end_on_offroad=True,            # 是否直接结束 episode
+        offroad_penalty=-5.0,           # 触发离路时附加一次性惩罚
+        min_steps_before_check=50       # 起步若干帧内不做检测，避免出场阶段误判
+    ):
+        super().__init__(env)
+        self.green_threshold = green_threshold
+        self.region_rel = region_rel
+        self.offroad_ratio_thresh = offroad_ratio_thresh
+        self.end_on_offroad = end_on_offroad
+        self.offroad_penalty = offroad_penalty
+        self.min_steps_before_check = min_steps_before_check
+        self._t = 0
+
+    def reset(self, **kwargs):
+        self._t = 0
+        obs, info = self.env.reset(**kwargs)
+        return obs, info
+
+    def _get_last_frame(self, obs):
+        # obs 可能是 (H,W,C) 或 (S,H,W,C)（FrameStack）
+        if obs.ndim == 4:  # (S,H,W,C)
+            frame = obs[-1]
+        else:
+            frame = obs
+        return frame
+
+    def _is_offroad(self, obs):
+        frame = self._get_last_frame(obs)  # uint8 HWC
+        H, W, C = frame.shape
+        y1r, y2r, x1r, x2r = self.region_rel
+        y1, y2 = int(H * y1r), int(H * y2r)
+        x1, x2 = int(W * x1r), int(W * x2r)
+        roi = frame[y1:y2, x1:x2]  # (h, w, 3)
+
+        # 更宽松的绿色检测：降低阈值，更容易检测到绿色
+        R = roi[..., 0].astype(np.int32)
+        G = roi[..., 1].astype(np.int32)
+        B = roi[..., 2].astype(np.int32)
+
+        # 更宽松的绿色判断：G明显高于R和B
+        green_mask = (G > R + 20) & (G > B + 20) & (G > 80)
+        
+        # 也可以检测"非道路"区域：检测草地、泥土等
+        # 检测高亮度的非灰色区域（可能是草地）
+        bright_non_gray = (G + R + B > 200) & (abs(G - R) > 30) & (abs(G - B) > 30)
+        
+        # 综合判断：绿色区域或高亮非灰色区域
+        offroad_mask = green_mask | bright_non_gray
+        offroad_ratio = offroad_mask.mean()
+        
+        return offroad_ratio > self.offroad_ratio_thresh, float(offroad_ratio)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._t += 1
+
+        # 默认不在前若干步检查，避免刚出发时视觉不稳定
+        if self._t >= self.min_steps_before_check:
+            offroad, offroad_ratio = self._is_offroad(obs)
+            info['offroad_green_ratio'] = offroad_ratio
+            if offroad:
+                # 附加惩罚（一次性）
+                reward = reward + self.offroad_penalty
+                if self.end_on_offroad:
+                    terminated = True
+                    info['early_terminated_offroad'] = True
+
+        return obs, reward, terminated, truncated, info
+
+def make_env():
+    env = gym.make('CarRacing-v3')             # 先创建原环境
+    env = OffRoadEarlyTerminate(env,           # 再加离路提前结束
+                                offroad_penalty=-5.0,
+                                end_on_offroad=True,
+                                min_steps_before_check=100,       # 增加起步检测延迟
+                                # 优化检测参数
+                                region_rel=(0.7, 0.9, 0.3, 0.7),  # 检测车辆前方更小区域
+                                offroad_ratio_thresh=0.5,          # 提高阈值，减少误判
+                                green_threshold=(50, 100, 50))     # 调整绿色检测阈值
+    return env
+
+
 class PPOBuffer:
     def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.9, adv_clip_range=3.0):
         self.gamma, self.lam = gamma, lam
@@ -1252,19 +1342,21 @@ class PPOAgent:
         video_dir = os.path.join(os.path.dirname(model_path), f'videos_epoch_{epoch}')
         os.makedirs(video_dir, exist_ok=True)
         
-        # 创建评估环境，指定render_mode
+        # 创建评估环境，使用与训练相同的环境配置
         import gymnasium as gym
-        # 从训练环境获取环境名称
-        if hasattr(self.env, 'spec') and self.env.spec:
-            env_name = self.env.spec.id
-        else:
-            env_name = 'CarRacing-v2'  # 默认环境
-        
-        eval_env = gym.make(env_name, render_mode='rgb_array')
+        # 重新创建环境，直接指定render_mode
+        base_env = gym.make('CarRacing-v3', render_mode='rgb_array')
+        eval_env = OffRoadEarlyTerminate(base_env,           # 再加离路提前结束
+                                        offroad_penalty=-5.0,
+                                        end_on_offroad=True,
+                                        min_steps_before_check=50,       # 增加起步检测延迟
+                                        # 优化检测参数
+                                        region_rel=(0.7, 0.9, 0.3, 0.7),  # 检测车辆前方更小区域
+                                        offroad_ratio_thresh=0.7,          # 提高阈值，减少误判
+                                        green_threshold=(50, 100, 50))     # 调整绿色检测阈值
         
         # 为CarRacing环境添加FrameStack
-        if 'CarRacing' in env_name:
-            eval_env = FrameStack(eval_env, stack_size=4)
+        eval_env = FrameStack(eval_env, stack_size=4)
         
         # 录制5段视频
         num_episodes = 2
@@ -1473,7 +1565,7 @@ if __name__ == '__main__':
         ac_kwargs = dict(hidden_sizes=[args.hid]*args.l)
     env_test.close()
 
-    ppo(lambda : gym.make(args.env), actor_critic=actor_critic,
+    ppo(lambda : make_env(), actor_critic=actor_critic,
         ac_kwargs=ac_kwargs, gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         pi_lr=args.pi_lr, vf_lr=args.vf_lr, train_pi_iters=args.train_pi_iters,
