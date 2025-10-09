@@ -330,22 +330,31 @@ class CNNActorCriticShared(nn.Module):
 
     # ---------- Public API ----------
 
-    def step(self, obs, return_env_action=True):
+    def step(self, obs, return_env_action=True, deterministic=False):
         """
         obs: (B,3,H,W) or (3,H,W). Returns:
           - action np.array (tanh space for training consistency)
           - value np.array
           - logp np.array (for the exact action fed back into policy gradient)
         If return_env_action=True and car_racing_mode, returns mapped env action.
+        If deterministic=True, uses mean action instead of sampling.
         """
         with torch.no_grad():
             if obs.dim() == 3:
                 obs = obs.unsqueeze(0)
             pi, feats = self._pi_dist(obs)
             if self.is_box:
-                a_tanh = pi.sample()  # in [-1,1]
-                v = self.v(feats)
-                logp = pi.log_prob(a_tanh)  # 统一使用tanh空间的log_prob
+                if deterministic:
+                    # 确定性动作：使用均值
+                    mu, log_std = self.pi(feats)
+                    a_tanh = torch.tanh(mu)  # 确定性tanh均值
+                    v = self.v(feats)
+                    logp = pi.log_prob(a_tanh)  # 计算确定性动作的log_prob
+                else:
+                    # 随机动作：采样
+                    a_tanh = pi.sample()  # in [-1,1]
+                    v = self.v(feats)
+                    logp = pi.log_prob(a_tanh)  # 统一使用tanh空间的log_prob
                 
                 if self.car_racing_mode and return_env_action:
                     a_env = self._map_to_carracing(a_tanh)
@@ -354,13 +363,18 @@ class CNNActorCriticShared(nn.Module):
                 else:
                     return a_tanh.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
             else:
-                a = pi.sample()
+                if deterministic:
+                    # 离散动作的确定性选择：选择概率最大的动作
+                    logits = self.policy_logits(feats)
+                    a = torch.argmax(logits, dim=-1)
+                else:
+                    a = pi.sample()
                 v = self.v(feats)
                 logp = pi.log_prob(a)
                 return a.cpu().numpy(), v.cpu().numpy(), logp.cpu().numpy()
 
-    def act(self, obs, return_env_action=True):
-        return self.step(obs, return_env_action=return_env_action)[0]
+    def act(self, obs, return_env_action=True, deterministic=False):
+        return self.step(obs, return_env_action=return_env_action, deterministic=deterministic)[0]
 
     # ---------- Training-time forward ----------
 
@@ -1008,7 +1022,7 @@ class PPOAgent:
         gpu_ratio = (gpu_time / total_time * 100) if total_time > 0 else 0        
         time_info = f" | GPU: {gpu_time:.2f}s({gpu_ratio:.1f}%)"
         
-        # 单行打印，严格对齐
+        # 单行打印，严格对齐（Return使用原始奖励，与评估一致）
         print(f"Epoch {epoch:4d} | Return: {ep_return:5.2f} | Policy Loss: {policy_loss:5.4f} | Value Loss: {value_loss:5.4f} | KL: {kl_div:8.4f} | Entropy: {entropy:5.4f} | ClipFrac: {clip_frac:5.4f} | Early Stop: {early_stop_flag:5s}{time_info}")
         
         # 记录到 TensorBoard - 基本训练指标
@@ -1018,9 +1032,10 @@ class PPOAgent:
         
         # 记录奖励和回合信息
         if self.epoch_metrics['ep_returns']:
-            self.tb_writer.add_scalar('Reward/Episode_Return', np.mean(self.epoch_metrics['ep_returns']), epoch)
+            # 记录原始奖励（与评估一致）
+            self.tb_writer.add_scalar('Reward/Episode_Return_Raw', np.mean(self.epoch_metrics['ep_returns']), epoch)
             if len(self.epoch_metrics['ep_returns']) > 1:
-                self.tb_writer.add_scalar('Reward/Episode_Return_Std', np.std(self.epoch_metrics['ep_returns']), epoch)
+                self.tb_writer.add_scalar('Reward/Episode_Return_Raw_Std', np.std(self.epoch_metrics['ep_returns']), epoch)
             else:
                 print(f"ep_returns={self.epoch_metrics['ep_returns']}")
         else:
@@ -1066,7 +1081,8 @@ class PPOAgent:
         # Prepare for interaction with environment
         start_time = time.time()
         o, _ = self.env.reset()
-        ep_ret, ep_len = 0, 0
+        ep_ret, ep_len = 0, 0  # 原始奖励和长度
+        ep_scaled_ret = 0  # 缩放后奖励
         prev_action = None  # 用于转向平滑
 
         # Main loop: collect experience in env and update/log each epoch
@@ -1127,8 +1143,9 @@ class PPOAgent:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} env action {action_for_env}")
                 
                 next_o, r, terminated, truncated, _ = self.env.step(action_for_env)
-                ep_ret += r
-                r_scaled = r / reward_scale
+                ep_ret += r  # 原始奖励
+                r_scaled = r / reward_scale  # 缩放后奖励
+                ep_scaled_ret += r_scaled  # 累计缩放后奖励
                 if epoch < num_debug_epochs and t < num_debug_steps:
                     print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} next_o {next_o.shape} r {r} terminated {terminated} truncated {truncated}")
                 cpu_end = time.time()
@@ -1187,12 +1204,13 @@ class PPOAgent:
                         print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} finish_path")
                     # if terminal:
                         # 记录到 TensorBoard 指标中
-                    self.epoch_metrics['ep_returns'].append(ep_ret)
+                    self.epoch_metrics['ep_returns'].append(ep_ret)  # 使用原始奖励
                     self.epoch_metrics['ep_lengths'].append(ep_len)
                     o, _ = self.env.reset()
                     if epoch < num_debug_epochs and t < num_debug_steps:
                         print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} reset")
-                    ep_ret, ep_len = 0, 0
+                    ep_ret, ep_len = 0, 0  # 重置原始奖励和长度
+                    ep_scaled_ret = 0  # 重置缩放后奖励
                     prev_action = None  # 重置前一个动作
             
             if epoch < num_debug_epochs:
@@ -1274,8 +1292,8 @@ class PPOAgent:
                         else:
                             obs_tensor = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
                         
-                        # 获取动作
-                        action = self.ac.act(obs_tensor)
+                        # 获取确定性动作（预运行阶段）
+                        action = self.ac.act(obs_tensor, deterministic=True)
                         
                         # 确保动作形状正确
                         if len(action.shape) > 1 and action.shape[0] == 1:
@@ -1326,8 +1344,8 @@ class PPOAgent:
                         else:
                             obs_tensor = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
                         
-                        # 获取动作
-                        action = self.ac.act(obs_tensor)
+                        # 获取确定性动作（录制阶段）
+                        action = self.ac.act(obs_tensor, deterministic=True)
                         
                         # 确保动作形状正确
                         if len(action.shape) > 1 and action.shape[0] == 1:
@@ -1362,6 +1380,7 @@ class PPOAgent:
         print(f"  最高奖励: {max_return:.2f}")
         print(f"  最低奖励: {min_return:.2f}")
         print(f"  视频保存目录: {video_dir}")
+        print(f"  🎯 使用确定性动作评估（减少随机性）")
         
         # 记录到TensorBoard
         self.tb_writer.add_scalar('Evaluation/Mean_Return', mean_return, epoch)
