@@ -504,10 +504,9 @@ def make_env():
 
 
 class PPOBuffer:
-    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.9, adv_clip_range=3.0):
+    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.9):
         self.gamma, self.lam = gamma, lam
         self.max_size = size
-        self.adv_clip_range = adv_clip_range  # 优势函数裁剪范围
         
         # 存储观测维度信息
         self.obs_dim = obs_dim
@@ -614,38 +613,16 @@ class PPOBuffer:
         all_adv = np.concatenate([t['adv'] for t in self.trajectories])
         all_logp = np.concatenate([t['logp'] for t in self.trajectories])
         all_deltas = np.concatenate([t['deltas'] for t in self.trajectories])
-        # all_obs = all_obs.astype(np.float32)
         
         # 统计GAE数值（规范化前）- 每10个epoch打印一次
-        
         if proc_id() == 0:
-            # 获取当前epoch信息（从训练循环中传递）
             current_epoch = getattr(self, '_current_epoch', 0)
             if current_epoch % 10 == 0:
                 self._print_gae_statistics(all_adv, all_ret, all_deltas)
         
-        # 对优势函数进行轻裁剪（winsorize），抑制长尾样本
-        all_adv = np.clip(all_adv, -self.adv_clip_range, self.adv_clip_range)
-        
-        if proc_id() == 0:
-            current_epoch = getattr(self, '_current_epoch', 0)
-            if current_epoch % 10 == 0:
-                print(f"  优势函数裁剪后: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
-        
-        # 归一化优势函数
+        # 直接归一化优势函数，不进行winsorize和增强
         adv_mean, adv_std = mpi_statistics_scalar(all_adv)
         all_adv = (all_adv - adv_mean) / adv_std
-        
-        # 如果标准差仍然太小，应用增强系数
-        if adv_std < 0.95:
-            boost_factor = 1.2
-            all_adv = all_adv * boost_factor
-            
-            if proc_id() == 0:
-                current_epoch = getattr(self, '_current_epoch', 0)
-                if current_epoch % 10 == 0:
-                    print(f"  优势函数增强: std={adv_std:.3f} < 0.95, 应用增强系数 {boost_factor}")
-                    print(f"  增强后优势函数: 均值={all_adv.mean():.6f}, 标准差={all_adv.std():.6f}")
         
         # 验证规范化后的优势函数 - 每10个epoch打印一次
         if proc_id() == 0:
@@ -680,11 +657,11 @@ class PPOBuffer:
         print(f"    最大值: {adv.max():.6f}")
         
         # 检查是否有极端值
-        extreme_positive = np.sum(adv > self.adv_clip_range)
-        extreme_negative = np.sum(adv < -self.adv_clip_range)
+        extreme_positive = np.sum(adv > 5.0)
+        extreme_negative = np.sum(adv < -5.0)
         if extreme_positive > 0 or extreme_negative > 0:
-            print(f"    极端值: {extreme_positive} 个 > {self.adv_clip_range}, {extreme_negative} 个 < -{self.adv_clip_range}")
-            print(f"    💡 将进行裁剪以抑制长尾样本影响")
+            print(f"    极端值: {extreme_positive} 个 > 5.0, {extreme_negative} 个 < -5.0")
+            print(f"    💡 注意：已移除winsorize裁剪，直接进行标准化")
         
         print(f"  回报统计:")
         print(f"    均值: {ret.mean():.6f}")
@@ -729,6 +706,68 @@ class PPOBuffer:
             print(f"  ⚠️  规范化后均值偏离0太多: {adv_normalized.mean():.6f}")
         if abs(adv_normalized.std() - 1.0) > 0.1:
             print(f"  ⚠️  规范化后标准差偏离1太多: {adv_normalized.std():.6f}")
+
+    def _print_policy_debug_info(self, ratio, logp_old, logp, adv, clipped):
+        """打印策略调试信息（仅在进程0打印）"""
+        
+        if proc_id() != 0:
+            return
+            
+        print(f"\n🔍 策略调试信息:")
+        
+        # Ratio分布统计
+        ratio_mean = ratio.mean().item()
+        ratio_std = ratio.std().item()
+        ratio_min = ratio.min().item()
+        ratio_max = ratio.max().item()
+        print(f"  Ratio分布:")
+        print(f"    均值: {ratio_mean:.6f}")
+        print(f"    标准差: {ratio_std:.6f}")
+        print(f"    最小值: {ratio_min:.6f}")
+        print(f"    最大值: {ratio_max:.6f}")
+        
+        # Logp差值统计
+        logp_diff = (logp_old - logp).detach()
+        logp_diff_mean = logp_diff.mean().item()
+        logp_diff_std = logp_diff.std().item()
+        logp_diff_min = logp_diff.min().item()
+        logp_diff_max = logp_diff.max().item()
+        print(f"  Logp差值 (logp_old - logp):")
+        print(f"    均值: {logp_diff_mean:.6f}")
+        print(f"    标准差: {logp_diff_std:.6f}")
+        print(f"    最小值: {logp_diff_min:.6f}")
+        print(f"    最大值: {logp_diff_max:.6f}")
+        
+        # 优势函数统计
+        adv_mean = adv.mean().item()
+        adv_std = adv.std().item()
+        adv_min = adv.min().item()
+        adv_max = adv.max().item()
+        print(f"  优势函数:")
+        print(f"    均值: {adv_mean:.6f}")
+        print(f"    标准差: {adv_std:.6f}")
+        print(f"    最小值: {adv_min:.6f}")
+        print(f"    最大值: {adv_max:.6f}")
+        
+        # Clip fraction统计
+        clipfrac = clipped.float().mean().item()
+        clipped_count = clipped.sum().item()
+        total_count = clipped.numel()
+        print(f"  Clip Fraction:")
+        print(f"    裁剪比例: {clipfrac:.6f}")
+        print(f"    裁剪样本数: {clipped_count}/{total_count}")
+        
+        # 检查异常情况
+        if clipfrac > 0.8:
+            print(f"  ⚠️  Clip fraction过高: {clipfrac:.4f} > 0.8")
+        if ratio_max > 10.0:
+            print(f"  ⚠️  Ratio最大值过大: {ratio_max:.4f} > 10.0")
+        if ratio_min < 0.1:
+            print(f"  ⚠️  Ratio最小值过小: {ratio_min:.4f} < 0.1")
+        if abs(logp_diff_mean) > 2.0:
+            print(f"  ⚠️  Logp差值均值过大: {logp_diff_mean:.4f}")
+        if adv_std > 2.0:
+            print(f"  ⚠️  优势函数标准差过大: {adv_std:.4f} > 2.0")
 
 class PPOAgent:
     def __init__(self, env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
@@ -905,7 +944,7 @@ class PPOAgent:
         num_procs_val = num_procs()
 
         self.local_steps_per_epoch = self.steps_per_epoch
-        self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam, adv_clip_range=3.0)
+        self.buf = PPOBuffer(self.obs_dim, self.act_dim, self.local_steps_per_epoch, self.gamma, self.lam)
 
         # Set up optimizers for policy and value function
         # 策略优化器优化encoder+pi，确保encoder参与策略学习
@@ -947,6 +986,12 @@ class PPOAgent:
         ent = pi.entropy().mean().item()
         clipped = ratio.gt(1+self.clip_ratio) | ratio.lt(1-self.clip_ratio)
         clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
+        
+        # 详细调试信息 - 每10个epoch打印一次
+        current_epoch = getattr(self.buf, '_current_epoch', 0)
+        if proc_id() == 0 and current_epoch % 10 == 0:
+            self._print_policy_debug_info(ratio, logp_old, logp, adv, clipped)
+        
         pi_info = dict(kl=approx_kl, ent=ent, cf=clipfrac)
 
         return loss_pi, pi_info
