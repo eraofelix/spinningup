@@ -773,7 +773,8 @@ class PPOAgent:
     def __init__(self, env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.15, pi_lr=3e-4,
                  vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-                 target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None, record_videos=False):
+                 target_kl=0.05, save_freq=100, device=None, min_steps_per_proc=None, record_videos=False,
+                 ent_coef=0.005):
 
         # Store parameters
         self.env_fn = env_fn
@@ -794,6 +795,7 @@ class PPOAgent:
         self.save_freq = save_freq
         self.min_steps_per_proc = min_steps_per_proc
         self.record_videos = record_videos
+        self.ent_coef = ent_coef
         
         # Setup device (GPU/CPU)
         if device is None:
@@ -949,8 +951,11 @@ class PPOAgent:
         # Set up optimizers for policy and value function
         # 策略优化器优化encoder+pi，确保encoder参与策略学习
         self.pi_optimizer = Adam(list(self.ac.encoder.parameters()) + list(self.ac.pi.parameters()), lr=self.pi_lr)
-        # 价值优化器只优化value头，避免重复优化encoder
-        self.vf_optimizer = Adam(self.ac.v.parameters(), lr=self.vf_lr)
+        # 价值优化器也优化encoder+v，让critic能适配视觉表征
+        self.vf_optimizer = Adam(list(self.ac.encoder.parameters()) + list(self.ac.v.parameters()), lr=self.vf_lr)
+        
+        # 设置学习率调度器 - warmup + cosine
+        self._setup_lr_schedulers()
 
         self.minibatch_size = 2048  # 如果总样本少于 2048，可设为 512 或 1024
         self.policy_epochs = 5
@@ -958,6 +963,31 @@ class PPOAgent:
 
         self.kl_history = []
         self.cf_history = []
+    
+    def _setup_lr_schedulers(self):
+        """设置warmup+cosine学习率调度器"""
+        from torch.optim.lr_scheduler import LambdaLR
+        import math
+        
+        # Warmup步数：前10%的epoch进行warmup
+        warmup_epochs = max(1, int(0.1 * self.epochs))
+        self.warmup_epochs = warmup_epochs
+        
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                # Warmup阶段：线性增长
+                return epoch / warmup_epochs
+            else:
+                # Cosine阶段：从warmup结束到训练结束
+                progress = (epoch - warmup_epochs) / (self.epochs - warmup_epochs)
+                return 0.5 * (1 + math.cos(math.pi * progress))
+        
+        # 为策略和价值函数分别设置调度器
+        self.pi_scheduler = LambdaLR(self.pi_optimizer, lr_lambda)
+        self.vf_scheduler = LambdaLR(self.vf_optimizer, lr_lambda)
+        
+        if proc_id() == 0:
+            print(f"📈 学习率调度: warmup={warmup_epochs} epochs, cosine={self.epochs-warmup_epochs} epochs")
 
     def _compute_loss_pi(self, data):
         """Compute PPO policy loss - 优化encoder+pi，确保encoder参与策略学习"""
@@ -979,11 +1009,15 @@ class PPOAgent:
         
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-self.clip_ratio, 1+self.clip_ratio) * adv
-        loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
+        
+        # 添加熵正则化
+        ent_coef = getattr(self, 'ent_coef', 0.005)  # 默认熵系数
+        entropy = pi.entropy().mean()
+        loss_pi = -(torch.min(ratio * adv, clip_adv)).mean() - ent_coef * entropy
 
-        # Useful extra info
-        approx_kl = (logp_old - logp).mean().item()
-        ent = pi.entropy().mean().item()
+        # 使用更稳健的KL近似（仅作监控）
+        robust_kl = 0.5 * ((logp - logp_old) ** 2).mean().item()
+        ent = entropy.item()
         clipped = ratio.gt(1+self.clip_ratio) | ratio.lt(1-self.clip_ratio)
         clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
         
@@ -992,14 +1026,14 @@ class PPOAgent:
         if proc_id() == 0 and current_epoch % 10 == 0:
             self._print_policy_debug_info(ratio, logp_old, logp, adv, clipped)
         
-        pi_info = dict(kl=approx_kl, ent=ent, cf=clipfrac)
+        pi_info = dict(kl=robust_kl, ent=ent, cf=clipfrac)
 
         return loss_pi, pi_info
 
     def _compute_loss_v(self, data):
         obs, ret = data['obs'], data['ret']
         obs = obs.to(self.device); ret = ret.to(self.device)
-        feats = self.ac.encoder(obs).detach()
+        feats = self.ac.encoder(obs)  # 移除detach，让critic优化也更新encoder
         v = self.ac.v(feats)
         return F.smooth_l1_loss(v, ret)
 
@@ -1087,6 +1121,7 @@ class PPOAgent:
                 self.vf_optimizer.zero_grad()
                 loss_v = self._compute_loss_v(mb)
                 loss_v.backward()
+                mpi_avg_grads(self.ac.encoder)  # 添加encoder梯度平均
                 mpi_avg_grads(self.ac.v)
                 self.vf_optimizer.step()
 
@@ -1101,32 +1136,6 @@ class PPOAgent:
         if len(self.kl_history) > 20:
             self.kl_history = self.kl_history[-20:]
             self.cf_history = self.cf_history[-20:]
-
-        # 自适应 pi_lr（每 3 个 epoch 判一次）
-        if len(self.kl_history) >= 3:
-            recent_kl = np.mean(self.kl_history[-3:])
-            recent_cf = np.mean(self.cf_history[-3:])
-            new_lr = None
-            
-            # 上调条件：连续3个epoch mean_KL < 0.5×target_kl 且 clip_frac > 0.6
-            if (recent_kl < 0.5 * self.target_kl) and (recent_cf > 0.6):
-                new_lr = min(self.pi_lr * 1.05, 1e-4)
-                
-                if proc_id() == 0:
-                    print(f"📈 提升pi_lr: KL={recent_kl:.4f} < {0.5 * self.target_kl:.4f}, CF={recent_cf:.4f} > 0.6")
-                    print(f"   pi_lr: {self.pi_lr:.2e} -> {new_lr:.2e}")
-            # 下调条件：KL过大或CF过小
-            elif (recent_kl > 2.0 * self.target_kl) or (recent_cf < 0.1):
-                new_lr = max(self.pi_lr * 0.95, 1e-5)
-                
-                if proc_id() == 0:
-                    print(f"📉 降低pi_lr: KL={recent_kl:.4f}, CF={recent_cf:.4f}")
-                    print(f"   pi_lr: {self.pi_lr:.2e} -> {new_lr:.2e}")
-            
-            if new_lr is not None and abs(new_lr - self.pi_lr) / self.pi_lr > 0.01:
-                for g in self.pi_optimizer.param_groups:
-                    g['lr'] = new_lr
-                self.pi_lr = new_lr  # 记录当前 lr
 
         # 写入指标（注意：这里用 old 的 pi_l_old/v_l_old 作为 epoch 级损失参考）
         ent_log = pi_info_old['ent'] if isinstance(pi_info_old, dict) and 'ent' in pi_info_old else 0.0
@@ -1207,6 +1216,12 @@ class PPOAgent:
         if self.device.type == 'cuda':
             gpu_memory = torch.cuda.memory_allocated() / 1024**2
             self.tb_writer.add_scalar('Performance/GPU_Memory_MB', gpu_memory, epoch)
+        
+        # 记录学习率
+        current_pi_lr = self.pi_optimizer.param_groups[0]['lr']
+        current_vf_lr = self.vf_optimizer.param_groups[0]['lr']
+        self.tb_writer.add_scalar('Learning_Rate/Policy_LR', current_pi_lr, epoch)
+        self.tb_writer.add_scalar('Learning_Rate/Value_LR', current_vf_lr, epoch)
         
         for key in self.epoch_metrics:
             self.epoch_metrics[key] = []
@@ -1372,6 +1387,10 @@ class PPOAgent:
             if epoch < num_debug_epochs:
                 print(f"Epoch {epoch} update end")
 
+            # 更新学习率调度器
+            self.pi_scheduler.step()
+            self.vf_scheduler.step()
+            
             # Log epoch info
             if epoch < num_debug_epochs:
                 print(f"Epoch {epoch} log epoch info start")
@@ -1550,10 +1569,12 @@ class PPOAgent:
 def ppo(env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.15, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.1, save_freq=100, device=None, min_steps_per_proc=None, record_videos=False):
+        target_kl=0.1, save_freq=100, device=None, min_steps_per_proc=None, record_videos=False,
+        ent_coef=0.005):
     agent = PPOAgent(env_fn, actor_critic, ac_kwargs, seed, steps_per_epoch, epochs, 
                     gamma, clip_ratio, pi_lr, vf_lr, train_pi_iters, train_v_iters, 
-                    lam, max_ep_len, target_kl, save_freq, device, min_steps_per_proc, record_videos)
+                    lam, max_ep_len, target_kl, save_freq, device, min_steps_per_proc, record_videos,
+                    ent_coef)
     agent.train()
 
 if __name__ == '__main__':
@@ -1585,6 +1606,7 @@ if __name__ == '__main__':
                        help='是否在保存checkpoint时录制视频')
     parser.add_argument('--save_freq', type=int, default=100, help='保存模型的频率')
     parser.add_argument('--max_ep_len', type=int, default=1000, help='每个episode的最大步数')
+    parser.add_argument('--ent_coef', type=float, default=0.005, help='熵正则化系数')
     args = parser.parse_args()
 
     
@@ -1627,4 +1649,5 @@ if __name__ == '__main__':
         max_ep_len=args.max_ep_len, device=device,
         min_steps_per_proc=args.min_steps_per_proc,
         save_freq=args.save_freq,
-        record_videos=args.record_videos)
+        record_videos=args.record_videos,
+        ent_coef=args.ent_coef)
