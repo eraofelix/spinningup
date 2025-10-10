@@ -707,68 +707,6 @@ class PPOBuffer:
         if abs(adv_normalized.std() - 1.0) > 0.1:
             print(f"  ⚠️  规范化后标准差偏离1太多: {adv_normalized.std():.6f}")
 
-    def _print_policy_debug_info(self, ratio, logp_old, logp, adv, clipped):
-        """打印策略调试信息（仅在进程0打印）"""
-        
-        if proc_id() != 0:
-            return
-            
-        print(f"\n🔍 策略调试信息:")
-        
-        # Ratio分布统计
-        ratio_mean = ratio.mean().item()
-        ratio_std = ratio.std().item()
-        ratio_min = ratio.min().item()
-        ratio_max = ratio.max().item()
-        print(f"  Ratio分布:")
-        print(f"    均值: {ratio_mean:.6f}")
-        print(f"    标准差: {ratio_std:.6f}")
-        print(f"    最小值: {ratio_min:.6f}")
-        print(f"    最大值: {ratio_max:.6f}")
-        
-        # Logp差值统计
-        logp_diff = (logp_old - logp).detach()
-        logp_diff_mean = logp_diff.mean().item()
-        logp_diff_std = logp_diff.std().item()
-        logp_diff_min = logp_diff.min().item()
-        logp_diff_max = logp_diff.max().item()
-        print(f"  Logp差值 (logp_old - logp):")
-        print(f"    均值: {logp_diff_mean:.6f}")
-        print(f"    标准差: {logp_diff_std:.6f}")
-        print(f"    最小值: {logp_diff_min:.6f}")
-        print(f"    最大值: {logp_diff_max:.6f}")
-        
-        # 优势函数统计
-        adv_mean = adv.mean().item()
-        adv_std = adv.std().item()
-        adv_min = adv.min().item()
-        adv_max = adv.max().item()
-        print(f"  优势函数:")
-        print(f"    均值: {adv_mean:.6f}")
-        print(f"    标准差: {adv_std:.6f}")
-        print(f"    最小值: {adv_min:.6f}")
-        print(f"    最大值: {adv_max:.6f}")
-        
-        # Clip fraction统计
-        clipfrac = clipped.float().mean().item()
-        clipped_count = clipped.sum().item()
-        total_count = clipped.numel()
-        print(f"  Clip Fraction:")
-        print(f"    裁剪比例: {clipfrac:.6f}")
-        print(f"    裁剪样本数: {clipped_count}/{total_count}")
-        
-        # 检查异常情况
-        if clipfrac > 0.8:
-            print(f"  ⚠️  Clip fraction过高: {clipfrac:.4f} > 0.8")
-        if ratio_max > 10.0:
-            print(f"  ⚠️  Ratio最大值过大: {ratio_max:.4f} > 10.0")
-        if ratio_min < 0.1:
-            print(f"  ⚠️  Ratio最小值过小: {ratio_min:.4f} < 0.1")
-        if abs(logp_diff_mean) > 2.0:
-            print(f"  ⚠️  Logp差值均值过大: {logp_diff_mean:.4f}")
-        if adv_std > 2.0:
-            print(f"  ⚠️  优势函数标准差过大: {adv_std:.4f} > 2.0")
-
 class PPOAgent:
     def __init__(self, env_fn, actor_critic, ac_kwargs=dict(), seed=0, 
                  steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.15, pi_lr=3e-4,
@@ -1023,9 +961,7 @@ class PPOAgent:
         
         # 详细调试信息 - 每10个epoch打印一次
         current_epoch = getattr(self.buf, '_current_epoch', 0)
-        if proc_id() == 0 and current_epoch % 10 == 0:
-            self._print_policy_debug_info(ratio, logp_old, logp, adv, clipped)
-        
+
         pi_info = dict(kl=robust_kl, ent=ent, cf=clipfrac)
 
         return loss_pi, pi_info
@@ -1145,6 +1081,10 @@ class PPOAgent:
         self.epoch_metrics['entropy'].append(ent_log)
         self.epoch_metrics['clip_frac'].append(mean_cf)
         self.epoch_metrics['stop_iter'].append(0)  # 不再用迭代计数作为早停标志
+        
+        # 更新学习率调度器（在优化器步骤之后）
+        self.pi_scheduler.step()
+        self.vf_scheduler.step()
 
     def _log_epoch_info(self, epoch, start_time):
         """Log epoch information"""
@@ -1377,7 +1317,7 @@ class PPOAgent:
             self.epoch_metrics['cpu_times'].append(epoch_cpu_time)
 
             # Save model
-            if (epoch % self.save_freq == 0) or (epoch == self.epochs-1):
+            if (epoch % self.save_freq == 10) or (epoch == self.epochs-1):
                 self._save_model(epoch)
 
             # Perform PPO update!
@@ -1386,10 +1326,6 @@ class PPOAgent:
             self._update()
             if epoch < num_debug_epochs:
                 print(f"Epoch {epoch} update end")
-
-            # 更新学习率调度器
-            self.pi_scheduler.step()
-            self.vf_scheduler.step()
             
             # Log epoch info
             if epoch < num_debug_epochs:
