@@ -542,10 +542,19 @@ class PPOBuffer:
         if hasattr(val, 'item'):
             val = val.item()
         self.current_traj['val'].append(float(val))
-        # 确保对数概率是标量
-        if hasattr(logp, 'item'):
-            logp = logp.item()
-        self.current_traj['logp'].append(float(logp))
+        
+        # 修复logp标量化问题：保持logp的完整形状，避免.item()导致的维度丢失
+        if isinstance(logp, np.ndarray):
+            # numpy数组：确保是一维标量数组
+            logp_processed = float(logp.reshape(-1)[0])
+        elif torch.is_tensor(logp):
+            # torch张量：先detach再转numpy，然后处理
+            logp_processed = float(logp.detach().cpu().numpy().reshape(-1)[0])
+        else:
+            # 已经是标量
+            logp_processed = float(logp)
+        
+        self.current_traj['logp'].append(logp_processed)
         
         self.total_steps += 1
 
@@ -635,12 +644,19 @@ class PPOBuffer:
         self.current_traj = None
         self.total_steps = 0
         
+        # 确保logp张量形状正确：每个样本对应一个logp值
+        logp_tensor = torch.as_tensor(all_logp, dtype=torch.float32)
+        if logp_tensor.dim() == 0:  # 标量张量
+            logp_tensor = logp_tensor.unsqueeze(0)
+        elif logp_tensor.dim() > 1:  # 多维张量，展平
+            logp_tensor = logp_tensor.flatten()
+        
         return {
             'obs': torch.as_tensor(all_obs, dtype=torch.float32),
             'act': torch.as_tensor(all_act, dtype=torch.float32),
             'ret': torch.as_tensor(all_ret, dtype=torch.float32),
             'adv': torch.as_tensor(all_adv, dtype=torch.float32),
-            'logp': torch.as_tensor(all_logp, dtype=torch.float32)
+            'logp': logp_tensor
         }
     
     def _print_gae_statistics(self, adv, ret, deltas):
@@ -931,6 +947,14 @@ class PPOAgent:
         """Compute PPO policy loss - 优化encoder+pi，确保encoder参与策略学习"""
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
         
+        # 验证logp形状 - 每10个epoch打印一次调试信息
+        current_epoch = getattr(self.buf, '_current_epoch', 0)
+        if proc_id() == 0 and current_epoch % 10 == 0:
+            print(f"🔍 logp形状验证 (Epoch {current_epoch}):")
+            print(f"  logp_old shape: {logp_old.shape}")
+            print(f"  logp_old dtype: {logp_old.dtype}")
+            print(f"  logp_old sample values: {logp_old[:5] if len(logp_old) >= 5 else logp_old}")
+        
         # Move data to device
         obs = obs.to(self.device)
         act = act.to(self.device)
@@ -945,8 +969,27 @@ class PPOAgent:
         pi = self.ac._pi_dist_from_params(mu, log_std)
         logp = pi.log_prob(act)
         
+        # 验证logp形状匹配 - 每10个epoch打印一次调试信息
+        if proc_id() == 0 and current_epoch % 10 == 0:
+            print(f"  logp_new shape: {logp.shape}")
+            print(f"  logp_new dtype: {logp.dtype}")
+            print(f"  logp_new sample values: {logp[:5] if len(logp) >= 5 else logp}")
+            print(f"  logp_old shape: {logp_old.shape}")
+            print(f"  logp_old dtype: {logp_old.dtype}")
+            print(f"  Shape match: {logp.shape == logp_old.shape}")
+        
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-self.clip_ratio, 1+self.clip_ratio) * adv
+        
+        # 验证ratio统计信息 - 每10个epoch打印一次调试信息
+        if proc_id() == 0 and current_epoch % 10 == 0:
+            print(f"  ratio shape: {ratio.shape}")
+            print(f"  ratio mean: {ratio.mean().item():.6f}")
+            print(f"  ratio std: {ratio.std().item():.6f}")
+            print(f"  ratio min: {ratio.min().item():.6f}")
+            print(f"  ratio max: {ratio.max().item():.6f}")
+            print(f"  ratio == 1.0 count: {(ratio == 1.0).sum().item()}")
+            print(f"  ratio sample values: {ratio[:5] if len(ratio) >= 5 else ratio}")
         
         # 添加熵正则化
         ent_coef = getattr(self, 'ent_coef', 0.005)  # 默认熵系数
@@ -1284,7 +1327,7 @@ class PPOAgent:
                             torch.cuda.synchronize()
                         gpu_start = time.time()
                         obs_tensor = torch.as_tensor(o, dtype=torch.float32).to(self.device)
-                        _, v, _ = self.ac.step(obs_tensor)  # 获取引导价值V(s_T)
+                        _, v, _ = self.ac.step(obs_tensor, return_env_action=False)  # 获取引导价值V(s_T)
                         if epoch < num_debug_epochs and t < num_debug_steps:
                             print(f"Epoch {epoch} step {t}/{self.local_steps_per_epoch} v {v}")
                         if self.device.type == 'cuda':
